@@ -162,6 +162,13 @@ _SOURCE_HOST = f"{socket.gethostname()}:{os.getpid()}"
 AUTH_HEADER_NAME   = os.environ.get("IG_AUTH_HEADER_NAME", "Authorization")
 AUTH_HEADER_PREFIX = os.environ.get("IG_AUTH_HEADER_PREFIX", "Bearer ")
 
+# INSTANT_GRAPH_BASE is https. If the gateway presents a certificate the system
+# trust store doesn't recognize (internal CA, self-signed), point this at a PEM
+# file/directory to verify against instead of every call failing with
+# SSLCertVerificationError. Leave unset to use the system default trust store.
+IG_CA_BUNDLE = os.environ.get("IG_CA_BUNDLE") or None
+IG_VERIFY = IG_CA_BUNDLE or True
+
 MCP_HOST  = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT  = int(os.environ.get("MCP_PORT", "8056"))
 DASH_HOST = os.environ.get("DASH_HOST", "0.0.0.0")
@@ -176,6 +183,13 @@ log = logging.getLogger("instant_graph_mcp")
 if not DB_PASSWORD:
     log.warning("IG_DB_PASSWORD is not set — Postgres calls (token store, login audit, "
                 "tool-call audit) will fail until it is provided via the environment.")
+
+if IG_CA_BUNDLE and not os.path.exists(IG_CA_BUNDLE):
+    log.warning("IG_CA_BUNDLE is set to %r but that path does not exist — Instant Graph "
+                "HTTPS calls will fail cert verification until it points at a real PEM "
+                "file/directory.", IG_CA_BUNDLE)
+elif IG_CA_BUNDLE:
+    log.info("Verifying Instant Graph TLS certificate against custom CA bundle: %s", IG_CA_BUNDLE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -562,7 +576,8 @@ class TokenManager:
 
             try:
                 resp = requests.post(
-                    LOGIN_URL, json={"email": email, "eid": eid}, timeout=REQUEST_TIMEOUT
+                    LOGIN_URL, json={"email": email, "eid": eid}, timeout=REQUEST_TIMEOUT,
+                    verify=IG_VERIFY,
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -689,7 +704,7 @@ def _call(method: str, url: str, *, session_key: Optional[str] = None,
     headers = tm.auth_headers()
     try:
         resp = _http.request(method, url, headers=headers, params=params, json=json_body,
-                              timeout=REQUEST_TIMEOUT)
+                              timeout=REQUEST_TIMEOUT, verify=IG_VERIFY)
     except requests.RequestException as exc:
         raise InstantGraphError(f"{method} {url} failed: {exc}") from exc
 
