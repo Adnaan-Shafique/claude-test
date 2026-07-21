@@ -166,7 +166,7 @@ AUTH_HEADER_PREFIX = os.environ.get("IG_AUTH_HEADER_PREFIX", "Bearer ")
 # trust store doesn't recognize (internal CA, self-signed), point this at a PEM
 # file/directory to verify against instead of every call failing with
 # SSLCertVerificationError. Leave unset to use the system default trust store.
-IG_CA_BUNDLE = os.environ.get("IG_CA_BUNDLE") or None
+IG_CA_BUNDLE = os.environ.get("IG_CA_BUNDLE", "/srv/ippms-assistant/ig_selfsigned.pem") or None
 IG_VERIFY = IG_CA_BUNDLE or True
 
 MCP_HOST  = os.environ.get("MCP_HOST", "0.0.0.0")
