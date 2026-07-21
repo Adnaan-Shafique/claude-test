@@ -170,6 +170,13 @@ AUTH_HEADER_PREFIX = os.environ.get("IG_AUTH_HEADER_PREFIX", "Bearer ")
 IG_CA_BUNDLE = os.environ.get("IG_CA_BUNDLE", "/srv/ippms-assistant/ig_selfsigned.pem") or None
 IG_VERIFY = IG_CA_BUNDLE or True
 
+# INSTANT_GRAPH_BASE connects by raw IP, but the cert's SAN is this DNS name
+# (not the IP) — without telling the TLS layer what name the cert is actually
+# valid for, every call fails with "IP address mismatch". Set to empty/unset
+# if INSTANT_GRAPH_BASE_URL is ever switched to use the hostname directly,
+# since normal hostname verification is preferable when it's available.
+IG_CERT_HOSTNAME = os.environ.get("IG_CERT_HOSTNAME", "ippms.vodafoneidea.com") or None
+
 MCP_HOST  = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT  = int(os.environ.get("MCP_PORT", "8056"))
 DASH_HOST = os.environ.get("DASH_HOST", "0.0.0.0")
@@ -704,25 +711,37 @@ def _build_ig_ssl_context() -> Optional[ssl.SSLContext]:
         return None
     ctx = ssl.create_default_context(cafile=IG_CA_BUNDLE)
     ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    if IG_CERT_HOSTNAME:
+        # We connect by raw IP but the cert's SAN is IG_CERT_HOSTNAME, not that
+        # IP. Disable ssl's own IP-vs-SAN check here; _PinnedSSLContextAdapter
+        # tells urllib3 to check the real hostname instead (assert_hostname).
+        ctx.check_hostname = False
     return ctx
 
 
 class _PinnedSSLContextAdapter(HTTPAdapter):
     """HTTPAdapter that always uses a pre-built SSLContext instead of the
     per-request verify=... path, so ssl.VERIFY_X509_PARTIAL_CHAIN (set above)
-    is actually applied to the handshake."""
+    is actually applied to the handshake. Also pins assert_hostname so the
+    cert's real SAN is checked instead of the IP we connect to."""
 
-    def __init__(self, ssl_context: ssl.SSLContext, *args, **kwargs) -> None:
+    def __init__(self, ssl_context: ssl.SSLContext, assert_hostname: Optional[str] = None,
+                 *args, **kwargs) -> None:
         self._ssl_context = ssl_context
+        self._assert_hostname = assert_hostname
         super().__init__(*args, **kwargs)
 
-    def init_poolmanager(self, *args, **kwargs):
+    def _pin(self, kwargs: dict) -> dict:
         kwargs["ssl_context"] = self._ssl_context
-        return super().init_poolmanager(*args, **kwargs)
+        if self._assert_hostname:
+            kwargs["assert_hostname"] = self._assert_hostname
+        return kwargs
+
+    def init_poolmanager(self, *args, **kwargs):
+        return super().init_poolmanager(*args, **self._pin(kwargs))
 
     def proxy_manager_for(self, *args, **kwargs):
-        kwargs["ssl_context"] = self._ssl_context
-        return super().proxy_manager_for(*args, **kwargs)
+        return super().proxy_manager_for(*args, **self._pin(kwargs))
 
 
 def _session_with_retries() -> requests.Session:
@@ -731,7 +750,7 @@ def _session_with_retries() -> requests.Session:
     s.mount("http://", HTTPAdapter(max_retries=retries))
     ig_ssl_context = _build_ig_ssl_context()
     if ig_ssl_context is not None:
-        s.mount("https://", _PinnedSSLContextAdapter(ig_ssl_context, max_retries=retries))
+        s.mount("https://", _PinnedSSLContextAdapter(ig_ssl_context, IG_CERT_HOSTNAME, max_retries=retries))
     else:
         s.mount("https://", HTTPAdapter(max_retries=retries))
     return s
