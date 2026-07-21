@@ -86,6 +86,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 import os
+import ssl
 import time
 import socket
 import logging
@@ -575,7 +576,10 @@ class TokenManager:
                 raise TokenError("Email and Employee ID are required before calling Instant Graph APIs.")
 
             try:
-                resp = requests.post(
+                # Uses the shared _http session (defined in SECTION 3) rather than a bare
+                # requests.post so the self-signed cert's pinned SSLContext (see
+                # _build_ig_ssl_context) is applied here too, not just on the other API calls.
+                resp = _http.post(
                     LOGIN_URL, json={"email": email, "eid": eid}, timeout=REQUEST_TIMEOUT,
                     verify=IG_VERIFY,
                 )
@@ -686,11 +690,50 @@ class InstantGraphError(RuntimeError):
     """Raised when an Instant Graph API call fails after retries."""
 
 
+def _build_ig_ssl_context() -> Optional[ssl.SSLContext]:
+    """Build the SSLContext used to verify Instant Graph's HTTPS cert.
+
+    Instant Graph's cert is self-signed and isn't the root of a longer chain,
+    so it's trusted directly via IG_CA_BUNDLE rather than a public CA. Plain
+    requests(verify=<path>) loads that file but still raises "self signed
+    certificate in certificate chain" on it — OpenSSL only accepts a
+    directly-trusted self-signed cert with VERIFY_X509_PARTIAL_CHAIN set,
+    which requests has no option for, hence the custom context here.
+    """
+    if not IG_CA_BUNDLE:
+        return None
+    ctx = ssl.create_default_context(cafile=IG_CA_BUNDLE)
+    ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    return ctx
+
+
+class _PinnedSSLContextAdapter(HTTPAdapter):
+    """HTTPAdapter that always uses a pre-built SSLContext instead of the
+    per-request verify=... path, so ssl.VERIFY_X509_PARTIAL_CHAIN (set above)
+    is actually applied to the handshake."""
+
+    def __init__(self, ssl_context: ssl.SSLContext, *args, **kwargs) -> None:
+        self._ssl_context = ssl_context
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = self._ssl_context
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args, **kwargs):
+        kwargs["ssl_context"] = self._ssl_context
+        return super().proxy_manager_for(*args, **kwargs)
+
+
 def _session_with_retries() -> requests.Session:
     s = requests.Session()
     retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[502, 503, 504])
     s.mount("http://", HTTPAdapter(max_retries=retries))
-    s.mount("https://", HTTPAdapter(max_retries=retries))
+    ig_ssl_context = _build_ig_ssl_context()
+    if ig_ssl_context is not None:
+        s.mount("https://", _PinnedSSLContextAdapter(ig_ssl_context, max_retries=retries))
+    else:
+        s.mount("https://", HTTPAdapter(max_retries=retries))
     return s
 
 
