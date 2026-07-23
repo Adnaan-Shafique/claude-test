@@ -75,6 +75,28 @@
 #       of guessing. Renders as an Interface/KPI/Value/Time table plus a new
 #       horizontal bar chart (build_rank_bar_chart).
 #
+#  v6.7 changes:
+#    1. New spike/dip (anomaly) detection shape: "show me the spikes/dips for
+#       KPI X on interface Y on device Z in the last N minutes/hours or
+#       between A and B" (§4.2A, aggregation "spikes"/"dips"/"anomalies").
+#       Each point is scored against a LOCAL baseline built from its own
+#       neighbors only (a rolling window, excluding the point itself — a
+#       plain centered rolling mean/std that includes the point lets a real
+#       spike drag its own baseline toward itself and dilute its z-score,
+#       caught via isolated simulation before shipping) and flagged when more
+#       than SPIKE_ZSCORE_THRESHOLD (default 2.5) standard deviations off
+#       that baseline. Requires exactly one named interface (spike detection
+#       needs one series to analyze); a missing interface, device, or KPI
+#       returns a clarification. Renders a compact flagged-events table
+#       (Interface/KPI/Type/Value/Time/Deviation), tags the existing raw
+#       time-series table with a Flag column, and overlays flagged points as
+#       distinct markers on the existing line chart (build_timeseries_fig's
+#       new optional `markers` param).
+#    2. parse_time_window now understands an explicit "between A and B" range
+#       (bare times or full date-times), not just relative phrases ("last N
+#       hours", "yesterday") — a pre-existing gap this feature's own examples
+#       relied on.
+#
 #  All reasoning runs on a LOCAL, airgapped open-source model (mistral-7b via
 #  your GPU inference proxy). No request ever leaves the local network.
 #
@@ -187,6 +209,17 @@ OBS_CHAR_CAP      = int(os.environ.get("VI_OBS_CHAR_CAP", "3500"))     # truncat
 # so "currently" is approximated as the most recent data point ("Last") within
 # this lookback window rather than a Min/Max/Avg over a long window.
 CURRENT_VALUE_LOOKBACK_SECONDS = int(os.environ.get("VI_CURRENT_VALUE_LOOKBACK_SECONDS", str(3 * 3600)))
+
+# "Show me the spikes/dips for KPI X on interface Y on device Z in the last N
+# minutes/hours or between A and B" (§4.2A anomaly-detection shape): a point
+# is flagged when it's more than SPIKE_ZSCORE_THRESHOLD standard deviations
+# from a rolling local baseline (window of SPIKE_ROLLING_WINDOW points,
+# centered on the point) — adapts to a genuine trend within the requested
+# window instead of comparing every point to one flat window-wide average.
+# Below SPIKE_MIN_POINTS points, a rolling baseline isn't meaningful.
+SPIKE_ROLLING_WINDOW    = int(os.environ.get("VI_SPIKE_ROLLING_WINDOW", "5"))
+SPIKE_ZSCORE_THRESHOLD  = float(os.environ.get("VI_SPIKE_ZSCORE_THRESHOLD", "2.5"))
+SPIKE_MIN_POINTS        = int(os.environ.get("VI_SPIKE_MIN_POINTS", "5"))
 
 DEBUG = os.environ.get("VI_DEBUG", "1") == "1"
 
@@ -1030,7 +1063,8 @@ _TIME_PHRASE_RE = re.compile(
     r"from .* to |ago)\b")
 _STAT_WORD_RE = re.compile(
     r"\b(min(imum)?|max(imum)?|avg|average|last value|peak|total|exceed(ed)?|"
-    r"cross(ed)?|above|over |greater than|threshold|compare|trend)\b")
+    r"cross(ed)?|above|over |greater than|threshold|compare|trend|"
+    r"spikes?|surges?|dips?|drops?|anomal(?:y|ies)|outliers?)\b")
 
 
 def _has_time_phrase(ql: str) -> bool:
@@ -1041,12 +1075,75 @@ def _has_stat_word(ql: str) -> bool:
     return bool(_STAT_WORD_RE.search(ql))
 
 
+# Explicit "between A and B" time range (§4.2A spike/dip detection shape — e.g.
+# "between 10:00 and 14:00" or "between 2024-01-01 10:00 and 2024-01-01 14:00").
+# parse_time_window otherwise only understands RELATIVE phrases ("last N
+# hours", "yesterday"); an explicit range fell through to its 24h default with
+# no attempt to parse it at all. Matches only well-shaped date/time tokens
+# (rather than lazily grabbing arbitrary text between "between"/"and") so it
+# can't misfire on unrelated prose.
+_MOMENT_TOKEN = r"(\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2})?|\d{1,2}:\d{2}\s*(?:am|pm)?)"
+_BETWEEN_RANGE_RE = re.compile(rf"\bbetween\s+{_MOMENT_TOKEN}\s+and\s+{_MOMENT_TOKEN}", re.IGNORECASE)
+
+
+def _parse_one_moment(token: str, base_date: datetime) -> Optional[datetime]:
+    """A single 'between'-range endpoint: either a full date(+time), or a bare
+    time of day applied to `base_date` (today, or yesterday if that word also
+    appears in the question — see _parse_between_range)."""
+    token = token.strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2}))?$", token)
+    if m:
+        y, mo, d, hh, mm = m.groups()
+        try:
+            return datetime(int(y), int(mo), int(d), int(hh or 0), int(mm or 0))
+        except ValueError:
+            return None
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(am|pm)?$", token, re.IGNORECASE)
+    if m:
+        hh, mm, ampm = m.groups()
+        hh, mm = int(hh), int(mm)
+        if ampm:
+            ampm = ampm.lower()
+            if ampm == "pm" and hh < 12:
+                hh += 12
+            if ampm == "am" and hh == 12:
+                hh = 0
+        if hh > 23 or mm > 59:
+            return None
+        return base_date.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return None
+
+
+def _parse_between_range(text: str) -> Optional[Tuple[int, int]]:
+    """'between A and B' -> (start_epoch, end_epoch), or None if not present /
+    not parseable. Bare times are assumed to be today unless "yesterday" is
+    also in the question; if B ends up before or equal to A (e.g. "between
+    22:00 and 02:00"), B is rolled to the next day (an overnight span)."""
+    m = _BETWEEN_RANGE_RE.search(text or "")
+    if not m:
+        return None
+    base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if re.search(r"\byesterday\b", text or "", re.IGNORECASE):
+        base_date -= timedelta(days=1)
+    a = _parse_one_moment(m.group(1), base_date)
+    b = _parse_one_moment(m.group(2), base_date)
+    if not a or not b:
+        return None
+    if b <= a:
+        b += timedelta(days=1)
+    return int(a.timestamp()), int(b.timestamp())
+
+
 def parse_time_window(text: str, entities: Dict[str, Any]) -> Tuple[int, int]:
     """Best-effort parse of a human time phrase to (start_epoch, end_epoch)."""
     # If the router already extracted numeric epochs, trust them.
     s, e = entities.get("start_time"), entities.get("end_time")
     if isinstance(s, (int, float)) and isinstance(e, (int, float)) and e > s:
         return int(s), int(e)
+
+    rng = _parse_between_range(text)
+    if rng:
+        return rng
 
     t = (text or "").lower()
     now = _now()
@@ -1893,7 +1990,8 @@ def build_stats_rows(values_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 #                              expected_result_shape column (test oracle).
 
 SPEC_AGGS = {"count", "list", "min", "max", "avg", "last", "total",
-             "top_n", "bottom_n", "threshold", "common", "summary"}
+             "top_n", "bottom_n", "threshold", "common", "summary",
+             "spikes", "dips", "anomalies"}
 
 _FIELD_BY_AGG = {"min": "Minimum", "max": "Maximum", "avg": "Average",
                  "last": "Last", "total": "Total"}
@@ -1916,6 +2014,80 @@ def _fmt_epoch_ms(ms: Any) -> str:
 
 def _host_name(h: Dict[str, Any]) -> str:
     return h.get("name") or h.get("host") or ""
+
+
+# Columns for the flagged spike/dip events summary table (§ user request:
+# "show me the spikes/dips for KPI X on interface Y on device Z ..."). Shared
+# by the executor and the UI so both agree on shape.
+SPIKE_COLS = ["Interface", "KPI", "Type", "Value", "Time", "Deviation (σ)"]
+
+
+def _rolling_zscores(values: List[float], window: int) -> List[Optional[float]]:
+    """Per-point z-score against a LOCAL baseline built from that point's own
+    neighbors only — a window of `window` points centered on it, EXCLUDING
+    the point itself.
+
+    BUGFIX (caught by isolated simulation before shipping): a plain centered
+    rolling mean/std over a window that INCLUDES the point being scored lets
+    a genuine spike drag its own baseline toward itself — e.g. a lone 5x
+    spike in a window of 5 pulls the mean/std up enough that its own z-score
+    lands under a 2.5 threshold, silently missing the exact thing this is
+    supposed to catch. Excluding the point from its own baseline (a
+    leave-one-out neighbor window) fixes this: the baseline reflects only
+    what's "normal" around the point, not the point itself.
+
+    None wherever there aren't enough neighbors, or the neighbors have zero
+    variance (flat local data), rather than a fabricated z-score. Requires at
+    least 3 neighbors (2 degrees of freedom for std) even at series edges —
+    2 neighbors gives only 1 degree of freedom, unstable enough that a
+    perfectly ordinary point next to one other nearby value can produce a
+    wildly exaggerated z-score (caught by isolated simulation: the last point
+    of a short series flagged as a "dip" off a 2-point baseline)."""
+    n = len(values)
+    half = max(1, window // 2)
+    min_neighbors = max(3, half)
+    out: List[Optional[float]] = []
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        neighbors = values[lo:i] + values[i + 1:hi]
+        if len(neighbors) < min_neighbors:
+            out.append(None)
+            continue
+        mean = sum(neighbors) / len(neighbors)
+        variance = sum((x - mean) ** 2 for x in neighbors) / (len(neighbors) - 1)
+        std = variance ** 0.5
+        out.append(None if std == 0 else (values[i] - mean) / std)
+    return out
+
+
+def _detect_spikes_dips(data_points: List[List[float]], direction: str,
+                        threshold: float = SPIKE_ZSCORE_THRESHOLD,
+                        window: int = SPIKE_ROLLING_WINDOW) -> List[Dict[str, Any]]:
+    """Flag spikes/dips in one KPI's time series via a rolling z-score.
+
+    `data_points` is one series[i]["data"]: [[epoch_ms, value], ...], already
+    filtered to well-formed [epoch_ms, value] pairs and assumed chronologically
+    ordered (as ig_get_kpi_history returns them). `direction` is "spikes"
+    (flag only above-threshold points), "dips" (below-threshold only), or
+    "anomalies" (both). Returns one dict per input point, in the same order:
+    {"epoch_ms", "value", "zscore", "flag": ""|"SPIKE"|"DIP"}.
+
+    Below SPIKE_MIN_POINTS points a rolling baseline isn't meaningful, so
+    nothing is flagged (the caller reports "not enough data" rather than a
+    false "no spikes/dips found")."""
+    if len(data_points) < SPIKE_MIN_POINTS:
+        return [{"epoch_ms": pt[0], "value": pt[1], "zscore": None, "flag": ""} for pt in data_points]
+    zscores = _rolling_zscores([pt[1] for pt in data_points], window)
+    out = []
+    for pt, z in zip(data_points, zscores):
+        flag = ""
+        if z is not None:
+            if z >= threshold and direction in ("spikes", "anomalies"):
+                flag = "SPIKE"
+            elif z <= -threshold and direction in ("dips", "anomalies"):
+                flag = "DIP"
+        out.append({"epoch_ms": pt[0], "value": pt[1], "zscore": z, "flag": flag})
+    return out
 
 
 def _spec_name_match(ent: Dict[str, Any], q: str, ql: str) -> Optional[Dict[str, Any]]:
@@ -1991,7 +2163,24 @@ def _spec_target(ent: Dict[str, Any], intent: str, ql: str) -> str:
     return "devices"
 
 
+_SPIKE_WORD_RE = re.compile(r"\b(spikes?|surges?)\b")
+_DIP_WORD_RE = re.compile(r"\b(dips?|drops?)\b")
+_ANOMALY_WORD_RE = re.compile(r"\b(anomal(?:y|ies)|outliers?|unusual)\b")
+
+
 def _spec_aggregation(ent: Dict[str, Any], ql: str, intent: str, target: str) -> str:
+    # Spike/dip detection (§ user request) is checked ahead of the "stats"
+    # intent branch below, and independent of it: these questions classify as
+    # plain "kpi" intent (they carry a time phrase but no top/bottom/threshold
+    # wording), so a check gated on intent=="stats" would never see them.
+    if target == "values":
+        has_spike, has_dip = bool(_SPIKE_WORD_RE.search(ql)), bool(_DIP_WORD_RE.search(ql))
+        if has_spike or has_dip or _ANOMALY_WORD_RE.search(ql):
+            if has_spike and not has_dip:
+                return "spikes"
+            if has_dip and not has_spike:
+                return "dips"
+            return "anomalies"
     if intent == "stats":
         if ent.get("threshold") is not None or any(
                 w in ql for w in ("exceed", "exceeded", "crossed", "above", "over ", "greater than")):
@@ -2095,6 +2284,8 @@ def _spec_result_shape(spec: Dict[str, Any]) -> str:
         return "scalar"
     if agg in ("top_n", "bottom_n", "threshold"):
         return "stats_table"
+    if agg in ("spikes", "dips", "anomalies"):
+        return "timeseries"
     if agg == "summary":
         return "timeseries" if spec["target"] == "values" and not spec.get("_multi") else "stats_table"
     return "explanatory_text"
@@ -3075,6 +3266,19 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
                 return _ok("text", {}, _component_clarification(raw, options, _host_name(devices[0])), tl)
             return _ok("text", {}, _rank_kpi_required_message(devices[0], comp_filter_chk, tl), tl)
 
+    # ── Spike/dip detection (§ user request: "show me the spikes/dips for KPI
+    # X on interface Y on device Z in the last N minutes/hours or between A
+    # and B"): analyzing one series for anomalies needs exactly one named
+    # interface — there's nothing to detect against otherwise.
+    if (spec.get("aggregation") in ("spikes", "dips", "anomalies")
+            and not (iface_filter and iface_filter.get("mode") == "exact" and iface_filter.get("value"))):
+        if not devices:
+            return _ok("text", {}, _device_not_found_message(spec, state), tl)
+        if len(devices) > 1:
+            return _ok("text", {}, _multiple_devices_message(devices), tl)
+        return _ok("text", {}, ("Spike/dip detection needs one specific interface to analyze. "
+                                f"Which interface on {_host_name(devices[0])} would you like to check?"), tl)
+
     # A question that names ONE specific interface ("... on Interface X of
     # device Y ...") goes through the staged validator: confirm the device is
     # right, confirm the interface actually exists on it, confirm the named KPI
@@ -3096,8 +3300,12 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
         series = hist.get("series", []) or []
         agg = spec["aggregation"]
         metric_field = _FIELD_BY_AGG.get(agg, "Maximum")
+        is_anomaly_agg = agg in ("spikes", "dips", "anomalies")
         rows = []
         ts_rows: List[Dict[str, Any]] = []
+        flagged_rows: List[Dict[str, Any]] = []
+        marker_points: Dict[int, List[Tuple[Any, float, str]]] = {}
+        total_points = 0
         for i, e in enumerate(entries):
             v = values[i] if i < len(values) else {}
             rows.append({
@@ -3115,13 +3323,55 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
             if i < len(series) and isinstance(series[i], dict):
                 series[i]["name"] = f"{e.get('suffix')} : {ready['interface_display']} : {_host_name(host)}"
             s = series[i] if i < len(series) else {}
-            for pt in (s.get("data") or []):
-                if len(pt) >= 2:
-                    ts_rows.append({
-                        "Device": _host_name(host), "Component": ready["component"],
+            data_pts = [pt for pt in (s.get("data") or []) if len(pt) >= 2]
+            total_points += len(data_pts)
+            # § user request: detect spikes/dips per KPI series via a rolling
+            # z-score, then tag both the raw time-series row (Flag column) and
+            # a compact flagged-events row for each point that crosses the
+            # threshold, plus its (epoch_ms, value, SPIKE|DIP) for the chart.
+            flags = _detect_spikes_dips(data_pts, agg) if is_anomaly_agg else None
+            for j, pt in enumerate(data_pts):
+                flag = flags[j]["flag"] if flags else ""
+                ts_row = {
+                    "Device": _host_name(host), "Component": ready["component"],
+                    "Interface": ready["interface_display"], "KPI": e.get("suffix"),
+                    "Value": pt[1], "Time": _fmt_epoch_ms(pt[0]),
+                }
+                if is_anomaly_agg:
+                    ts_row["Flag"] = flag
+                ts_rows.append(ts_row)
+                if flag:
+                    z = flags[j]["zscore"]
+                    flagged_rows.append({
                         "Interface": ready["interface_display"], "KPI": e.get("suffix"),
-                        "Value": pt[1], "Time": _fmt_epoch_ms(pt[0]),
+                        "Type": "Spike" if flag == "SPIKE" else "Dip", "Value": pt[1],
+                        "Time": _fmt_epoch_ms(pt[0]), "Deviation (σ)": round(z, 2) if z is not None else None,
                     })
+                    marker_points.setdefault(i, []).append((pt[0], pt[1], flag))
+        if is_anomaly_agg:
+            direction_word = {"spikes": "spike(s)", "dips": "dip(s)", "anomalies": "spike(s)/dip(s)"}[agg]
+            flagged_rows.sort(key=lambda r: r["Time"])
+            if flagged_rows:
+                answer = (f"Found {len(flagged_rows)} {direction_word} for "
+                         f"{', '.join(sorted({r['KPI'] for r in flagged_rows}))} on "
+                         f"{ready['interface_display']} of {_host_name(host)}: " +
+                         "; ".join(f"{r['Type']} {r['Value']} at {r['Time']}" for r in flagged_rows[:5]) +
+                         (f" (+{len(flagged_rows) - 5} more)" if len(flagged_rows) > 5 else "") + ".")
+            elif total_points < SPIKE_MIN_POINTS:
+                answer = (f"Only {total_points} data point(s) were available on "
+                         f"{ready['interface_display']} of {_host_name(host)} in this window — not enough "
+                         f"to reliably detect {direction_word}. Try a longer window.")
+            else:
+                answer = (f"No {direction_word} detected for "
+                         f"{', '.join(str(e.get('suffix')) for e in entries)} on "
+                         f"{ready['interface_display']} of {_host_name(host)} in this window.")
+            chart = build_timeseries_fig({"series": series}, markers=marker_points)
+            payload = {"rows": flagged_rows, "cols": SPIKE_COLS, "count": len(flagged_rows),
+                      "history": {"series": series}, "timeseries_rows": ts_rows,
+                      "ts_cols": TIMESERIES_COLS + ["Flag"]}
+            if chart is not None:
+                payload["chart"] = chart
+            return _ok("stats", payload, answer, tl)
         if agg in _FIELD_BY_AGG and len(rows) == 1:
             r = rows[0]
             return _ok("scalar", {"rows": rows, "cols": ["Device", "KPI", "Minimum", "Maximum",
@@ -3691,7 +3941,13 @@ def run_agent(user_query: str, session_key: str) -> VIAgentState:
 PAL = ["#22d3ee", "#34d399", "#f59e0b", "#f87171", "#a78bfa", "#38bdf8", "#fb7185"]
 
 
-def build_timeseries_fig(history: Dict[str, Any]) -> Optional[go.Figure]:
+def build_timeseries_fig(history: Dict[str, Any],
+                         markers: Optional[Dict[int, List[Tuple[Any, float, str]]]] = None
+                         ) -> Optional[go.Figure]:
+    """`markers`, when given, overlays flagged spike/dip points (§ user
+    request) on top of a series' line: {series_index: [(epoch_ms, value,
+    "SPIKE"|"DIP"), ...]}. Optional and defaults to None so every pre-existing
+    caller (plain KPI/stats charts) is unaffected."""
     series = history.get("series", []) if isinstance(history, dict) else []
     if not series:
         return None
@@ -3703,10 +3959,31 @@ def build_timeseries_fig(history: Dict[str, Any]) -> Optional[go.Figure]:
         ys = [pt[1] for pt in data if len(pt) >= 2]
         if not xs:
             continue
+        series_name = str(s.get("name", f"series {i+1}"))[:80]
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
                       line=dict(color=PAL[i % len(PAL)], width=2),
-                      name=str(s.get("name", f"series {i+1}"))[:80]))
+                      name=series_name))
         n += 1
+        # Spike/dip markers for this series, in front of the plain legend
+        # (showlegend=False) so a long KPI-series legend doesn't double in
+        # length — the color/shape/hover text already identify spike vs dip.
+        flagged = (markers or {}).get(i) or []
+        spikes = [(t, v) for t, v, k in flagged if k == "SPIKE"]
+        dips = [(t, v) for t, v, k in flagged if k == "DIP"]
+        if spikes:
+            fig.add_trace(go.Scatter(
+                x=[datetime.fromtimestamp(t / 1000.0) for t, v in spikes], y=[v for t, v in spikes],
+                mode="markers", marker=dict(color="#f87171", size=10, symbol="triangle-up",
+                                            line=dict(color="#7f1d1d", width=1)),
+                name=f"{series_name} — spike", showlegend=False,
+                hovertemplate=f"{series_name}<br>Spike: %{{y}}<extra></extra>"))
+        if dips:
+            fig.add_trace(go.Scatter(
+                x=[datetime.fromtimestamp(t / 1000.0) for t, v in dips], y=[v for t, v in dips],
+                mode="markers", marker=dict(color="#38bdf8", size=10, symbol="triangle-down",
+                                            line=dict(color="#0c4a6e", width=1)),
+                name=f"{series_name} — dip", showlegend=False,
+                hovertemplate=f"{series_name}<br>Dip: %{{y}}<extra></extra>"))
     # § user request: side-by-side (horizontal) legend entries ran into each
     # other and became indistinguishable once labels got longer (KPI :
     # Interface : Device). Stack them vertically instead, one per line, below
@@ -3968,13 +4245,15 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
     kind = state.get("result_kind", "text")
 
     rows, cols, fig_json, stats = [], [], None, []
-    # The interface-ranking "currently" shape (§ user request) hands back a
-    # ready-made bar chart (payload["chart"]) instead of a time-series history
-    # — prefer it when present, since there's no line-chart-worthy series here.
-    rank_chart = payload.get("chart")
+    # Some result shapes hand back a ready-made figure in payload["chart"]
+    # instead of a plain history to build one from — the interface-ranking
+    # "currently" bar chart (§ user request) and the spike/dip line chart with
+    # flagged-point markers already baked in (§ user request) both do this.
+    # Prefer it when present.
+    preset_chart = payload.get("chart")
     hist = payload.get("history", {})
-    if rank_chart is not None:
-        fig_json = pio.to_json(rank_chart)
+    if preset_chart is not None:
+        fig_json = pio.to_json(preset_chart)
     elif hist:
         fig = build_timeseries_fig(hist)
         if fig is not None:
@@ -3995,7 +4274,10 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
     # the ReAct fallback path has no structured per-point device/component/
     # interface breakdown to build it from, so it stays empty there.
     ts_rows = payload.get("timeseries_rows") or []
-    ts_cols = TIMESERIES_COLS if ts_rows else []
+    # The spike/dip detection payload (§ user request) supplies its own
+    # ts_cols (TIMESERIES_COLS + "Flag") so the raw time-series table shows
+    # the tag; every other path keeps the plain shared column list.
+    ts_cols = (payload.get("ts_cols") or TIMESERIES_COLS) if ts_rows else []
 
     # ReAct trace (fallback path only) for the legacy reasoning panel.
     trace_view = []
