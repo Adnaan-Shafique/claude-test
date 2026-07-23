@@ -913,11 +913,17 @@ def circle_match(text: str) -> Optional[str]:
 
 
 def host_in_circle(host_name: str, circle_canon: str) -> bool:
+    """A device belongs to a circle only if its name STARTS WITH one of that
+    circle's tokens — not merely contains one. § user request/bugfix: a
+    "contains" check let e.g. "DELAAIGJKKAI" (starts with DEL -> Delhi) be
+    counted as Gujarat too just because "GJ" appears later in the name; only
+    a device actually beginning with a circle's own token (e.g.
+    "GJAKKAIANRBN") belongs to it."""
     tokens = CIRCLE_TOKENS.get(circle_canon, {}).get("tokens", [])
     if not tokens:            # PAN INDIA / unknown -> everything
         return True
     up = (host_name or "").upper()
-    return any(tok in up for tok in tokens)
+    return any(up.startswith(tok) for tok in tokens)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
