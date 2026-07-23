@@ -60,6 +60,21 @@
 #       component, interface, KPI, target/metric/aggregation, top-N, threshold,
 #       time window) and what each resolved to against live data.
 #
+#  v6.6 changes:
+#    1. New interface-ranking analytical shape: "top/bottom N interfaces for
+#       KPI X on device Y currently" (§4.2A, build_spec/_execute_values). The
+#       API has no live-value endpoint, so "currently" is approximated as the
+#       most recent ("Last") data point within a short lookback window
+#       (CURRENT_VALUE_LOOKBACK_SECONDS, default 3h) rather than a historical
+#       Min/Max/Avg — narrowly gated on a top_n/bottom_n aggregation + the
+#       word "interface(s)" + no explicit time phrase, so the pre-existing
+#       "top N DEVICES by KPI over <window>" shape is untouched. The KPI's
+#       owning component is auto-guessed from KPI_SYNONYMS when not named
+#       (self-heals via the existing zero-result recheck if wrong); a missing
+#       KPI or an ambiguous/unresolved device returns a clarification instead
+#       of guessing. Renders as an Interface/KPI/Value/Time table plus a new
+#       horizontal bar chart (build_rank_bar_chart).
+#
 #  All reasoning runs on a LOCAL, airgapped open-source model (mistral-7b via
 #  your GPU inference proxy). No request ever leaves the local network.
 #
@@ -166,6 +181,12 @@ REACT_MAX_STEPS   = int(os.environ.get("VI_REACT_MAX_STEPS", "8"))
 REACT_MAX_REPAIRS = int(os.environ.get("VI_REACT_MAX_REPAIRS", "1"))
 HOSTS_CACHE_TTL   = int(os.environ.get("VI_HOSTS_CACHE_TTL", "300"))   # seconds
 OBS_CHAR_CAP      = int(os.environ.get("VI_OBS_CHAR_CAP", "3500"))     # truncate tool observations for the 7B
+
+# "Top/bottom N interfaces for KPI X on device Y currently" (§4.2A interface-
+# ranking shape): the API has no live-value endpoint, only historical ranges,
+# so "currently" is approximated as the most recent data point ("Last") within
+# this lookback window rather than a Min/Max/Avg over a long window.
+CURRENT_VALUE_LOOKBACK_SECONDS = int(os.environ.get("VI_CURRENT_VALUE_LOOKBACK_SECONDS", str(3 * 3600)))
 
 DEBUG = os.environ.get("VI_DEBUG", "1") == "1"
 
@@ -1001,6 +1022,25 @@ def _now() -> int:
     return int(time.time())
 
 
+# Shared by router_node's kpi_q/metadata_q backstops and build_spec's
+# interface-ranking "currently" detection (§4.2A) — one definition of "this
+# question names an explicit historical time phrase" for both call sites.
+_TIME_PHRASE_RE = re.compile(
+    r"\b(last|yesterday|today|this (week|month)|hour|day|week|between|since|"
+    r"from .* to |ago)\b")
+_STAT_WORD_RE = re.compile(
+    r"\b(min(imum)?|max(imum)?|avg|average|last value|peak|total|exceed(ed)?|"
+    r"cross(ed)?|above|over |greater than|threshold|compare|trend)\b")
+
+
+def _has_time_phrase(ql: str) -> bool:
+    return bool(_TIME_PHRASE_RE.search(ql))
+
+
+def _has_stat_word(ql: str) -> bool:
+    return bool(_STAT_WORD_RE.search(ql))
+
+
 def parse_time_window(text: str, entities: Dict[str, Any]) -> Tuple[int, int]:
     """Best-effort parse of a human time phrase to (start_epoch, end_epoch)."""
     # If the router already extracted numeric epochs, trust them.
@@ -1414,13 +1454,7 @@ def router_node(state: VIAgentState) -> VIAgentState:
     # retrieve the requested data".
     if route == "kpi_q":
         ql = q.lower()
-        has_time = bool(re.search(
-            r"\b(last|yesterday|today|this (week|month)|hour|day|week|between|since|"
-            r"from .* to |ago)\b", ql))
-        has_stat = bool(re.search(
-            r"\b(min(imum)?|max(imum)?|avg|average|last value|peak|total|exceed(ed)?|"
-            r"cross(ed)?|above|over |greater than|threshold|compare|trend)\b", ql))
-        if not has_time and not has_stat:
+        if not _has_time_phrase(ql) and not _has_stat_word(ql):
             route = "metadata_q"
 
     # Symmetric counterpart of the backstop just above: a question the router
@@ -1435,13 +1469,7 @@ def router_node(state: VIAgentState) -> VIAgentState:
     # — the exact inconsistency this backstop closes.
     if route == "metadata_q":
         ql = q.lower()
-        has_time = bool(re.search(
-            r"\b(last|yesterday|today|this (week|month)|hour|day|week|between|since|"
-            r"from .* to |ago)\b", ql))
-        has_stat = bool(re.search(
-            r"\b(min(imum)?|max(imum)?|avg|average|last value|peak|total|exceed(ed)?|"
-            r"cross(ed)?|above|over |greater than|threshold|compare|trend)\b", ql))
-        if has_time or has_stat:
+        if _has_time_phrase(ql) or _has_stat_word(ql):
             route = "kpi_q"
 
     # Deterministic backstop #2: "list/how many/give me devices
@@ -1865,7 +1893,7 @@ def build_stats_rows(values_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 #                              expected_result_shape column (test oracle).
 
 SPEC_AGGS = {"count", "list", "min", "max", "avg", "last", "total",
-             "top_n", "threshold", "common", "summary"}
+             "top_n", "bottom_n", "threshold", "common", "summary"}
 
 _FIELD_BY_AGG = {"min": "Minimum", "max": "Maximum", "avg": "Average",
                  "last": "Last", "total": "Total"}
@@ -1921,7 +1949,8 @@ def _spec_name_match(ent: Dict[str, Any], q: str, ql: str) -> Optional[Dict[str,
 
 
 def _spec_intent(ent: Dict[str, Any], route: str, ql: str) -> str:
-    if (ent.get("top_n") or re.search(r"\btop\s+\d+", ql) or "top " in ql
+    if (ent.get("top_n") or re.search(r"\b(top|bottom)\s+\d+", ql) or "top " in ql
+            or "bottom " in ql or "highest" in ql or "lowest" in ql
             or ent.get("threshold") is not None
             or any(w in ql for w in ("exceed", "exceeded", "crossed", "above", "over ", "greater than"))):
         return "stats"
@@ -1967,6 +1996,11 @@ def _spec_aggregation(ent: Dict[str, Any], ql: str, intent: str, target: str) ->
         if ent.get("threshold") is not None or any(
                 w in ql for w in ("exceed", "exceeded", "crossed", "above", "over ", "greater than")):
             return "threshold"
+        # "bottom 5" / "lowest 5" / "smallest 5" ranks ascending; everything
+        # else that reached "stats" intent (top N, or a bare "top"/"highest"
+        # mention) ranks descending, same as before this check existed.
+        if re.search(r"\bbottom\b", ql) or "lowest" in ql or "smallest" in ql:
+            return "bottom_n"
         return "top_n"
     if "common" in ql and target == "components":
         return "common"
@@ -2059,7 +2093,7 @@ def _spec_result_shape(spec: Dict[str, Any]) -> str:
         return "list"
     if agg in ("min", "max", "avg", "last", "total"):
         return "scalar"
-    if agg in ("top_n", "threshold"):
+    if agg in ("top_n", "bottom_n", "threshold"):
         return "stats_table"
     if agg == "summary":
         return "timeseries" if spec["target"] == "values" and not spec.get("_multi") else "stats_table"
@@ -2144,8 +2178,49 @@ def build_spec(state: VIAgentState) -> Dict[str, Any]:
     kpi_filter = _spec_kpi_filter(ent, q, _as_text(ent.get("device")), _as_text(ent.get("component")),
                                   iface, _as_text(ent.get("circle")))
 
+    # ── Interface-ranking "currently" shape (§ user request): "top/bottom N
+    # interfaces for KPI X on device Y currently" — ranks interfaces on ONE
+    # device by their most recent ("Last") value, not a historical Min/Max/Avg
+    # over an explicit window. Narrowly gated on target=="values" + a top_n/
+    # bottom_n aggregation + the word "interface(s)" appearing in the question,
+    # so it never touches the pre-existing "top N DEVICES by KPI over <window>"
+    # shape (no "interface" mention there), nor a ranking question that DOES
+    # name an explicit time window (that keeps using Maximum over that window,
+    # the existing behavior). See CURRENT_VALUE_LOOKBACK_SECONDS.
+    current_value = (agg in ("top_n", "bottom_n") and target == "values"
+                     and "interface" in ql and not _has_time_phrase(ql))
+
+    # This shape ranks ACROSS every interface on the device — a single named
+    # interface_filter here would only ever be router noise (the question
+    # asks to rank interfaces, not to fetch one already-named one), and would
+    # otherwise wrongly divert execution to the single-interface validator.
+    if current_value:
+        interface_filter = None
+
+    # A named KPI with no explicit component -> guess the owning component from
+    # the domain synonym table (e.g. "HC In Octets" -> "traffic") so the
+    # executor scopes to the right component up front instead of scanning every
+    # component on the device. A wrong guess still self-heals: the zero-result
+    # recheck mechanism (_maybe_recheck) already widens to every component if
+    # this narrows to nothing.
+    if current_value and not component_filter and not component_filter_raw and kpi_filter:
+        hint = _kpi_component_hint(kpi_filter.get("value") or "")
+        if hint:
+            component_filter = [hint]
+
+    # "top/bottom N" in the raw text is a more reliable N than the router's
+    # own top_n entity, which the local 7B doesn't reliably populate for a
+    # "bottom N" phrasing (its prompt only ever showed "top N" examples).
+    top_n_ql = None
+    m_topn = re.search(r"\b(?:top|bottom|highest|lowest)\s+(\d+)\b", ql)
+    if m_topn:
+        top_n_ql = int(m_topn.group(1))
+
     tw = None
-    if g.get("start_time"):
+    if current_value:
+        now = _now()
+        tw = {"start": now - CURRENT_VALUE_LOOKBACK_SECONDS, "end": now}
+    elif g.get("start_time"):
         tw = {"start": int(g["start_time"]), "end": int(g["end_time"])}
 
     spec = {
@@ -2158,7 +2233,8 @@ def build_spec(state: VIAgentState) -> Dict[str, Any]:
         "interface_filter": interface_filter,
         "kpi_filter": kpi_filter,
         "time_window": tw,
-        "top_n": ent.get("top_n") or (5 if agg == "top_n" else None),
+        "current_value": current_value,
+        "top_n": ent.get("top_n") or top_n_ql or (5 if agg in ("top_n", "bottom_n") else None),
         "threshold": _spec_threshold(ent, q),
     }
     spec["result_shape"] = _spec_result_shape(spec)
@@ -2353,6 +2429,17 @@ def _device_not_found_message(spec: Dict[str, Any], state: VIAgentState) -> str:
     return msg
 
 
+def _multiple_devices_message(devices: List[Dict[str, Any]]) -> str:
+    """Shared 'which one did you mean' clarification for a device_filter that
+    matched more than one host, used by both the single-interface KPI-value
+    path and the interface-ranking ('top N interfaces ... currently') path —
+    both need exactly one device to proceed."""
+    names = [_host_name(h) for h in devices[:8]]
+    more = "..." if len(devices) > 8 else ""
+    return (f"That matched {len(devices)} devices, so I'm not sure which one you mean: "
+           f"{', '.join(names)}{more}. Could you give the exact device name?")
+
+
 def _resolve_component_filter(spec: Dict[str, Any], devices: List[Dict[str, Any]],
                               tl: "_ToolLog"):
     """If the question named a component the fast-path regex didn't recognize
@@ -2393,6 +2480,35 @@ def _component_clarification(raw: str, options: List[str], host_name: str) -> st
            f"Available components: {', '.join(sample)}{more}.")
 
 
+def _rank_kpi_required_message(host: Dict[str, Any], comp_filter: Optional[List[str]],
+                               tl: "_ToolLog") -> str:
+    """Ranking interfaces needs exactly one KPI to sort by. If a component is
+    already known, sample one of its interfaces for the real KPI names on
+    offer (cheap: 1-2 calls, not a per-interface fan-out); otherwise point at
+    the device's component list as the first thing to narrow down."""
+    host_name = _host_name(host)
+    if comp_filter:
+        by_comp = _interfaces_by_component_for(host, comp_filter, tl)
+        items = []
+        for payload in by_comp.values():
+            items = _norm_items(payload)
+            if items:
+                break
+        sample_kpis: List[str] = []
+        if items:
+            data = tl.call("ig_list_kpis", {"host_id": host["hostid"], "cid": host["cid"],
+                                            "prefix": {comp_filter[0]: [items[0]]}})
+            sample_kpis = sorted({_as_text(e.get("suffix")) for grp in data.get("results", {}).values()
+                                  for e in grp if e.get("suffix")})
+        hint = f" Example KPIs on this component: {', '.join(sample_kpis[:10])}." if sample_kpis else ""
+        return (f"Ranking interfaces needs a single KPI to sort by. Which KPI on the "
+               f"{comp_filter[0]} component of {host_name} would you like to rank by?{hint}")
+    comps = _components_for(host, tl)
+    return (f"Ranking interfaces needs a single KPI to sort by, and I couldn't tell which "
+           f"component it belongs to. Available components on {host_name}: "
+           f"{', '.join(comps) or '(none)'}. Which KPI (and component) would you like to rank by?")
+
+
 def _validate_single_interface_kpi(spec: Dict[str, Any], state: VIAgentState,
                                    devices: List[Dict[str, Any]], tl: "_ToolLog"):
     """Stage-validate device -> interface -> KPI for a question naming ONE
@@ -2412,10 +2528,7 @@ def _validate_single_interface_kpi(spec: Dict[str, Any], state: VIAgentState,
     if not devices:
         return None, _device_not_found_message(spec, state)
     if len(devices) > 1:
-        names = [_host_name(h) for h in devices[:8]]
-        more = "..." if len(devices) > 8 else ""
-        return None, (f"That matched {len(devices)} devices, so I'm not sure which one you mean: "
-                      f"{', '.join(names)}{more}. Could you give the exact device name?")
+        return None, _multiple_devices_message(devices)
     host = devices[0]
     host_name = _host_name(host)
 
@@ -2944,6 +3057,24 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
         raw_values = kpi_filter.get("values") or ([kpi_filter.get("value")] if kpi_filter.get("value") else [])
         wanted_kpis_all = [_as_text(v).strip().lower() for v in raw_values if _as_text(v).strip()]
 
+    # ── Interface-ranking "currently" shape (§ user request: "top/bottom N
+    # interfaces for KPI X on device Y currently"): this ranking is inherently
+    # scoped to exactly one device, and needs exactly one KPI to rank
+    # interfaces by. Validate both up front — a missing/ambiguous device or a
+    # missing KPI would otherwise either crash downstream or silently rank by
+    # the wrong thing, rather than asking the user what's missing.
+    if spec.get("current_value"):
+        if not devices:
+            return _ok("text", {}, _device_not_found_message(spec, state), tl)
+        if len(devices) > 1:
+            return _ok("text", {}, _multiple_devices_message(devices), tl)
+        if not kpi_filter:
+            comp_filter_chk, unresolved = _resolve_component_filter(spec, devices, tl)
+            if unresolved:
+                raw, options = unresolved
+                return _ok("text", {}, _component_clarification(raw, options, _host_name(devices[0])), tl)
+            return _ok("text", {}, _rank_kpi_required_message(devices[0], comp_filter_chk, tl), tl)
+
     # A question that names ONE specific interface ("... on Interface X of
     # device Y ...") goes through the staged validator: confirm the device is
     # right, confirm the interface actually exists on it, confirm the named KPI
@@ -3100,7 +3231,9 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
 
     # Flatten to per-KPI rows, keyed by device/interface, with a normalized value.
     agg = spec["aggregation"]
-    metric_field = _FIELD_BY_AGG.get(agg, "Maximum")  # for top_n/threshold default peak
+    # "currently" ranks by the most recent value ("Last"), never a Min/Max/Avg
+    # over the (short, currency-only) lookback window built for this shape.
+    metric_field = "Last" if spec.get("current_value") else _FIELD_BY_AGG.get(agg, "Maximum")
     all_series: List[Dict[str, Any]] = []
     rows: List[Dict[str, Any]] = []
     ts_rows: List[Dict[str, Any]] = []
@@ -3118,6 +3251,9 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
                 "Total": v.get("Total"), "Units": v.get("units"),
                 "_metric_bytes": to_bytes(v.get(metric_field)),
             }
+            if spec.get("current_value"):
+                row["_interface_disp"] = p.get("interface") or ""
+                row["_kpi_name"] = p.get("kpi") or ""
             rows.append(row)
             # Raw per-point rows for the downloadable time-series table (§ user
             # request): series[i] is the same itemid/position as picks[i], since
@@ -3132,6 +3268,9 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
             if i < len(series) and isinstance(series[i], dict):
                 series[i]["name"] = f"{p.get('kpi') or ''} : {p.get('interface') or ''} : {p['host']}"
             s = series[i] if i < len(series) else {}
+            if spec.get("current_value"):
+                data_pts = s.get("data") or []
+                row["_last_time"] = _fmt_epoch_ms(data_pts[-1][0]) if data_pts else None
             for pt in (s.get("data") or []):
                 if len(pt) >= 2:
                     ts_rows.append({
@@ -3146,7 +3285,7 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
     is_multi = not single_device or len(rows) > 1
 
     # ---- apply aggregation ----
-    if agg in ("top_n", "threshold"):
+    if agg in ("top_n", "bottom_n", "threshold"):
         ranked = [r for r in rows if r["_metric_bytes"] is not None]
         # stats scope: for 'top N DEVICES' collapse to per-device peak
         by_device = "device" in state["user_query"].lower() and "interface" not in state["user_query"].lower()
@@ -3157,15 +3296,47 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
                 if d not in best or (r["_metric_bytes"] or 0) > (best[d]["_metric_bytes"] or 0):
                     best[d] = r
             ranked = list(best.values())
-        ranked.sort(key=lambda r: (r["_metric_bytes"] or 0.0, r["KPI"]), reverse=True)
-        if agg == "top_n":
+        # "bottom N" ranks ascending (lowest first); everything else (top N,
+        # threshold) keeps the existing descending order.
+        reverse_sort = agg != "bottom_n"
+        ranked.sort(key=lambda r: (r["_metric_bytes"] or 0.0, r["KPI"]), reverse=reverse_sort)
+        if agg in ("top_n", "bottom_n"):
             n = int(spec.get("top_n") or 5)
             ranked = ranked[:n]
-            head = f"Top {n} by {metric_field.lower()}"
+            head = f"{'Top' if agg == 'top_n' else 'Bottom'} {n} by {metric_field.lower()}"
         else:
             thr = spec.get("threshold") or 0.0
             ranked = [r for r in ranked if (r["_metric_bytes"] or 0.0) > thr]
             head = f"{len(ranked)} item(s) over threshold"
+
+        if spec.get("current_value"):
+            # § user request: "top/bottom N interfaces for KPI X on device Y
+            # currently" — an Interface-centric ranking table (+ bar chart)
+            # instead of the generic Device/Min/Max/Avg/Total shape used by
+            # the pre-existing cross-device/cross-window top_n/threshold path.
+            out_rows = [{
+                "Interface": r.get("_interface_disp") or "",
+                "KPI": r.get("_kpi_name") or r["KPI"],
+                "Value": r.get(metric_field),
+                "Time": r.get("_last_time") or "—",
+                "Units": r.get("Units"),
+            } for r in ranked]
+            cols = ["Interface", "KPI", "Value", "Time", "Units"]
+            dev_name = _host_name(devices[0]) if devices else ""
+            if out_rows:
+                answer = (f"{head} on {dev_name}: " +
+                         "; ".join(f"{r['Interface']} ({r['Value']} {r['Units'] or ''})".strip()
+                                   for r in out_rows[:5]) + ".")
+            else:
+                answer = (f"None of {dev_name}'s interfaces had a recent value for the requested "
+                         f"KPI in the last {CURRENT_VALUE_LOOKBACK_SECONDS // 3600} hour(s).")
+            payload = {"rows": out_rows, "cols": cols, "count": len(out_rows),
+                      "history": {"series": []}, "timeseries_rows": ts_rows}
+            chart = build_rank_bar_chart(out_rows, head)
+            if chart is not None:
+                payload["chart"] = chart
+            return _ok("stats", payload, answer, tl)
+
         out_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in ranked]
         cols = ["Device", "KPI", "Minimum", "Maximum", "Last", "Average", "Total", "Units"]
         return _ok("stats", {"rows": out_rows, "cols": cols, "count": len(out_rows),
@@ -3550,6 +3721,30 @@ def build_timeseries_fig(history: Dict[str, Any]) -> Optional[go.Figure]:
     return fig
 
 
+def build_rank_bar_chart(rows: List[Dict[str, Any]], title: str = "") -> Optional[go.Figure]:
+    """Horizontal bar chart for the 'top/bottom N interfaces ... currently'
+    ranking (§ user request) — rows are already in rank order (best/worst
+    first), one bar per interface, labeled with its formatted current value.
+    A reversed y-axis keeps rank #1 at the top regardless of top/bottom
+    direction, since both are pre-sorted the same way by the caller."""
+    if not rows:
+        return None
+    labels = [str(r.get("Interface", "")) for r in rows]
+    values = [to_bytes(r.get("Value")) or 0.0 for r in rows]
+    text = [f"{r.get('Value')} {r.get('Units') or ''}".strip() for r in rows]
+    fig = go.Figure(go.Bar(x=values, y=labels, orientation="h",
+                          marker=dict(color=PAL[0]),
+                          text=text, textposition="auto"))
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#0f1626", plot_bgcolor="#0f1626",
+                      margin=dict(l=160, r=18, t=36 if title else 18, b=36),
+                      height=max(220, 42 * len(rows) + 90),
+                      title=dict(text=title, font=dict(size=12, color="#7c8aa5")) if title else None,
+                      yaxis=dict(autorange="reversed"),
+                      xaxis=dict(showticklabels=False),
+                      font=dict(family="Inter, sans-serif", size=11, color="#e2e8f0"))
+    return fig
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 14 — PIPELINE (called by the UI)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3661,9 +3856,11 @@ def build_params_view(state: VIAgentState) -> List[Dict[str, str]]:
     if tw or ent.get("time_phrase") or g.get("start_time"):
         start = tw.get("start") or g.get("start_time")
         end = tw.get("end") or g.get("end_time")
+        how_tw = ("parsed from the question" if ent.get("time_phrase")
+                 else ("\"currently\" lookback (most recent value, interface ranking)"
+                       if spec.get("current_value") else "default window"))
         add("Time window", ent.get("time_phrase"),
-            f"{_fmt_epoch(start)} → {_fmt_epoch(end)}" if start and end else None,
-            "parsed from the question" if ent.get("time_phrase") else "default window")
+            f"{_fmt_epoch(start)} → {_fmt_epoch(end)}" if start and end else None, how_tw)
 
     add("Devices in scope", None, g.get("total_hosts"), "total devices visible to your login")
     return rows
@@ -3771,8 +3968,14 @@ def pipeline(user_query: str, session_key: str) -> Dict[str, Any]:
     kind = state.get("result_kind", "text")
 
     rows, cols, fig_json, stats = [], [], None, []
+    # The interface-ranking "currently" shape (§ user request) hands back a
+    # ready-made bar chart (payload["chart"]) instead of a time-series history
+    # — prefer it when present, since there's no line-chart-worthy series here.
+    rank_chart = payload.get("chart")
     hist = payload.get("history", {})
-    if hist:
+    if rank_chart is not None:
+        fig_json = pio.to_json(rank_chart)
+    elif hist:
         fig = build_timeseries_fig(hist)
         if fig is not None:
             fig_json = pio.to_json(fig)
