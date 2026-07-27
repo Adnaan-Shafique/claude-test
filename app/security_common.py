@@ -20,6 +20,7 @@ import re
 import json
 import time
 import secrets
+import difflib
 from typing import Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import create_engine, text
@@ -377,22 +378,47 @@ SAFETY & SCOPE RULES (non-negotiable, apply to every response):
 
 # Deterministic, pre-model input classifier. This runs BEFORE any LLM call
 # so a jailbroken/creative model response can never bypass it.
+#
+# NOTE ON COVERAGE: this is a regex-based first line of defense, not a full
+# NLU classifier — it will not catch every possible paraphrase or misspelling
+# ("dynamyoiite", "uranium-23332"). It is deliberately paired with (a) the
+# scope-gate LLM node, which independently rejects anything not recognizably
+# a domain question regardless of exact wording, and (b) sanitize_output()
+# on the response, so a miss here is not the only backstop.
 _BLOCK_PATTERNS: List[Tuple[str, str]] = [
-    ("prompt_injection_leak", r"\b(translate|repeat|paraphrase|summarize|print|reveal|show)\b[^.\n]{0,40}\b(system prompt|instructions?|guidelines?|rules?|prior text|text above|initial prompt)\b"),
-    ("prompt_injection_leak", r"\b(what|reveal|show|tell me)\b[^.\n]{0,20}\byour (system )?(prompt|instructions?|guidelines?)\b"),
+    ("prompt_injection_leak", r"\b(translate|repeat|paraphrase|summarize|print|reveal|show|give me|share|output|provide|dump|list)\b[^.\n]{0,40}\b(system prompt|internal instructions?|your instructions?|guidelines?|prior text|text above|initial prompt|above this (line|point)|everything above|our conversation so far|this conversation)\b"),
+    ("prompt_injection_leak", r"\b(what|reveal|show|tell me|give me|share)\b[^.\n]{0,20}\byour (system )?(prompt|instructions?|guidelines?|config(uration)?)\b"),
     ("persona_manipulation", r"\b(developer mode|unfiltered ai|unrestricted mode|dan mode|jailbreak|do anything now|act as (an?|the) (unfiltered|unrestricted|uncensored))\b"),
-    ("persona_manipulation", r"\byou are now\b.{0,40}\b(admin|administrator|root|system|unrestricted|unfiltered)\b"),
+    ("persona_manipulation", r"\b(you are now|pretend (you are|to be)|imagine you are|from now on you are)\b.{0,40}\b(admin|administrator|root|system|unrestricted|unfiltered|no filters?|without (any )?(filters?|restrictions?))\b"),
     ("persona_manipulation", r"\brespond as (two|2|multiple) personas?\b"),
-    ("weapons_hazmat", r"\b(synthesi[sz]e|make|manufactur\w*|extract|produce)\b[^.\n]{0,40}\b(dynamite|tnt|nerve agent|nitroglycerin|uranium[- ]?23[35]|plutonium|sarin|explosive|chemical weapon|biological weapon|sulphuric acid|sulfuric acid)\b"),
+    ("instruction_override", r"\bignore\b[^.\n]{0,30}\b(your|previous|prior|all|any|these)\b[^.\n]{0,20}\b(restrictions?|rules?|instructions?|guidelines?|filters?)\b"),
+    ("instruction_override", r"\b(disregard|bypass|override)\b[^.\n]{0,30}\b(your|previous|these)\b[^.\n]{0,20}\b(restrictions?|rules?|instructions?|guidelines?|filters?)\b"),
+    ("weapons_hazmat", r"\b(synthesi[sz]e|mak\w*|manufactur\w*|extract\w*|produc\w*|build\w*)\b[^.\n]{0,40}\b(dynamite|tnt|nerve agent|nitroglycerin|uranium|plutonium|sarin|explosives?|chemical weapons?|biological weapons?|sulphuric acid|sulfuric acid)\b"),
     ("weapons_hazmat", r"\b(step[- ]by[- ]step|detailed)\b[^.\n]{0,40}\b(bomb|explosive|weapon)\b"),
     ("malicious_code", r"\b(write|generate|build|create)\b[^.\n]{0,40}\b(keylogger|ransomware|rootkit|reverse shell|malware|exploit|worm|trojan)\b"),
     ("malicious_code", r"\b(bypass|evade)\b[^.\n]{0,30}\b(firewall|waf|antivirus|security control|edr)\b"),
     ("malicious_code", r"\bprivilege escalation\b.{0,40}\b(attack|exploit|chain|payload)\b"),
     ("hate_violence", r"\b(benefit|justif\w*|advantage)s?\b[^.\n]{0,40}\b(genocide|mass violence|ethnic cleansing|atrocit\w*)\b"),
-    ("abusive_language", r"\b(abusive|offensive|profane|vulgar|toxic)\b[^.\n]{0,20}\b(tone|language|message|reply|response)\b.{0,20}\b(write|generate|give me|create)\b"),
-    ("abusive_language", r"\b(write|generate|give me|create)\b[^.\n]{0,20}\b(abusive|offensive|profane|vulgar|toxic)\b[^.\n]{0,20}\b(tone|language|message|reply|response)\b"),
+    ("hate_violence", r"\b(genocide|mass violence|ethnic cleansing|atrocit\w*)\b[^.\n]{0,40}\b(benefit\w*|justif\w*|advantage\w*)\b"),
+    ("abusive_language", r"\b(abusive|offensive|profane|vulgar|toxic)\b[^.\n]{0,20}\b(tone|language|message|reply|response|rant|text|note|email|comment|content|words)\b.{0,20}\b(write|generate|give me|create)\b"),
+    ("abusive_language", r"\b(write|generate|give me|create)\b[^.\n]{0,20}\b(abusive|offensive|profane|vulgar|toxic)\b[^.\n]{0,20}\b(tone|language|message|reply|response|rant|text|note|email|comment|content|words)\b"),
+    ("abusive_language", r"\b(respond|reply|answer)\b[^.\n]{0,30}\b(in|with)\b[^.\n]{0,20}\b(the )?(most )?(abusive|offensive|profane|vulgar|toxic)\b[^.\n]{0,15}\b(tone|manner|way|language)\b"),
+    ("credential_modification", r"\b(change|reset|update|set)\b[^.\n]{0,20}\b(my |the |your )?password\b"),
 ]
 _COMPILED_BLOCK_PATTERNS = [(cat, re.compile(pat, re.IGNORECASE)) for cat, pat in _BLOCK_PATTERNS]
+
+# Fuzzy backstop for misspelled high-risk terms (e.g. "dynamyoiite" for
+# "dynamite") that no literal regex will match. Cheap, stdlib-only
+# (difflib), intentionally short and high-precision — this is a backstop,
+# not the primary defense; the scope-gate LLM node is what actually catches
+# semantically-off-topic/harmful requests regardless of spelling.
+_FUZZY_WATCHLIST: Dict[str, str] = {
+    "dynamite": "weapons_hazmat", "nitroglycerin": "weapons_hazmat",
+    "uranium": "weapons_hazmat", "plutonium": "weapons_hazmat",
+    "sarin": "weapons_hazmat", "explosive": "weapons_hazmat",
+    "keylogger": "malicious_code", "ransomware": "malicious_code",
+    "rootkit": "malicious_code",
+}
 
 
 def classify_blocked_request(user_text: str) -> Optional[str]:
@@ -402,16 +428,22 @@ def classify_blocked_request(user_text: str) -> Optional[str]:
     for category, pattern in _COMPILED_BLOCK_PATTERNS:
         if pattern.search(user_text):
             return category
+    for word in re.findall(r"[A-Za-z]{6,}", user_text):
+        match = difflib.get_close_matches(word.lower(), _FUZZY_WATCHLIST.keys(), n=1, cutoff=0.72)
+        if match:
+            return _FUZZY_WATCHLIST[match[0]]
     return None
 
 
 REFUSAL_MESSAGES: Dict[str, str] = {
     "prompt_injection_leak": "I can't share or restate my internal instructions or configuration, in any language or format.",
     "persona_manipulation": "I can't switch personas, modes, or roles that bypass my normal operating rules.",
+    "instruction_override": "I can't ignore or bypass my operating rules — happy to help within them.",
     "weapons_hazmat": "I can't help with instructions for weapons, explosives, or hazardous/controlled materials.",
     "malicious_code": "I can't help write malicious code, exploits, or techniques to bypass security controls.",
     "hate_violence": "I can't produce content that justifies or frames mass violence or atrocities as beneficial.",
     "abusive_language": "I can't generate abusive, offensive, or toxic content.",
+    "credential_modification": "I can't change or reset passwords — this application only answers reporting/analytics questions. Please use your organization's standard password reset process.",
 }
 
 

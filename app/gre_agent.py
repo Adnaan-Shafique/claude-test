@@ -69,7 +69,7 @@ import plotly.io as pio
 from security_common import (
     build_sql_validator, db_connect_args, required_secret, SessionStore,
     SAFETY_PREAMBLE, classify_blocked_request, refusal_for, sanitize_output,
-    validate_upload, SecurityAuditLogger, DDL_DML_KEYWORDS,
+    validate_upload, SecurityAuditLogger, DDL_DML_KEYWORDS, SQLSecurityError,
 )
 
 print("✅ All imports OK")
@@ -1042,6 +1042,9 @@ class GREAgentState(TypedDict):
     failed:           bool
     failure_reason:   str
     fallback_used:    bool
+    security_blocked: bool
+    in_scope:         bool
+    out_of_scope:     bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1758,6 +1761,59 @@ _tbl_block = "\n".join(
     for t, s in TABLE_SUMMARIES.items()
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCOPE GATE — runs BEFORE the Router. See falcon_agent.py for the detailed
+#  rationale: live testing showed off-topic/admin-flavored questions reaching
+#  SQL generation, which invented plausible-but-fake SQL and then hallucinated
+#  a confident answer from the empty/irrelevant result.
+# ══════════════════════════════════════════════════════════════════════════════
+
+SCOPE_GATE_SYSTEM = f"""\
+{SAFETY_PREAMBLE}
+You are a strict scope gate for GRE (Global Roamers Excellence), a Vi
+(Vodafone Idea) roaming analytics reporting assistant. GRE answers questions
+answerable by querying the tables below — in/out-roamer footprint, inbound
+and outbound failure rates, error/response codes, Welcome SMS logs, roaming
+steering/partner configuration, and NTR (network transaction routing) logs.
+Nothing else.
+
+AVAILABLE TABLES AND WHAT THEY COVER:
+{_tbl_block}
+
+Classify the user's message as IN_SCOPE or OUT_OF_SCOPE.
+
+IN_SCOPE means: a genuine reporting/analytics question answerable by a
+read-only SELECT against the tables above (roamer counts, failure rates,
+error codes, SMS delivery, steering/partner lookups, NTR/attach events,
+trends, comparisons), including follow-up questions, greetings, or
+requests to clarify/rephrase a prior answer.
+
+OUT_OF_SCOPE means ANY of the following, even if phrased as a data
+question or dressed up in domain language:
+ - Asking about this system's own configuration, database internals,
+   connection details, SSL/TLS status, version, server IP, credentials,
+   or logs (this is infrastructure self-inspection, not roaming reporting)
+ - Requests to create, modify, delete, or otherwise change data or schema
+   (this app is read-only reporting; even if phrased as a normal question
+   like "create a test database" or "delete X")
+ - Requests to change a password or account credentials
+ - General programming/code-writing requests unrelated to querying these
+   tables (e.g. "write a hello world app", scripts, automation tools)
+ - Storytelling, roleplay, hypotheticals, or "continue this story" framing
+ - Requests to describe or profile a person by demographic characteristics
+ - General knowledge, historical, or security-research questions (CVEs,
+   historical events, how-to questions) with no connection to this data
+ - Anything else clearly unrelated to the tables listed above
+
+When genuinely unsure between a plausible domain question and an
+off-topic one, prefer IN_SCOPE — this gate is for clear-cut cases, not a
+second content filter (that already runs separately).
+
+Return STRICT JSON only:
+{{"scope": "IN_SCOPE" or "OUT_OF_SCOPE", "reasoning": "<one short sentence>"}}
+""".strip()
+
+
 ROUTER_SYSTEM = f"""\
 {SAFETY_PREAMBLE}
 You are the GRE (Global Roamers Excellence) query routing agent for a telecom roaming analytics platform.
@@ -2241,13 +2297,19 @@ Return STRICT JSON only:
     exec_result = run_exec_retry(fb_sql, fb_params, refined_schema, query) if fb_sql else {
         "df": None, "exec_error": "No SQL generated", "exec_valid": False, "exec_attempts": 0}
 
-    df      = exec_result.get("df")
-    summary = summarize_dataframe(df)
-    answer  = call_llm(
-        EXPLANATION_SYSTEM,
-        f"Question: {query}\nSQL:\n{fb_sql[:500]}\n\nResult:\n{json.dumps(summary, indent=2, default=str)[:2500]}",
-        max_new_tokens=400, decode_config=EXPLANATION_DECODE, stage_label="FALLBACK_EXPLAIN",
-    ).strip() or "Fallback pipeline completed — see results."
+    df = exec_result.get("df")
+    if df is not None and df.empty:
+        answer = ("The query ran successfully but returned no matching records. "
+                  "Try adjusting the filters or time range.")
+    elif df is None:
+        answer = f"Could not retrieve data. {exec_result.get('exec_error', '')}".strip()
+    else:
+        summary = summarize_dataframe(df)
+        answer  = call_llm(
+            EXPLANATION_SYSTEM,
+            f"Question: {query}\nSQL:\n{fb_sql[:500]}\n\nResult:\n{json.dumps(summary, indent=2, default=str)[:2500]}",
+            max_new_tokens=400, decode_config=EXPLANATION_DECODE, stage_label="FALLBACK_EXPLAIN",
+        ).strip() or "Fallback pipeline completed — see results."
 
     return {
         **prior,
@@ -2268,6 +2330,37 @@ Return STRICT JSON only:
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 12 — LANGGRAPH NODES
 # ══════════════════════════════════════════════════════════════════════════════
+
+SCOPE_REFUSAL_MESSAGE = (
+    "I can only answer reporting questions about GRE's roaming analytics data "
+    "— footprint, failure rates, error codes, SMS, steering/partners, and NTR "
+    "logs. Could you rephrase your question around one of those?"
+)
+
+
+def scope_gate_node(state: GREAgentState) -> GREAgentState:
+    print("\n" + "="*60)
+    print("[NODE] SCOPE GATE")
+    print("="*60)
+    query = state["user_query"]
+    raw   = call_llm(SCOPE_GATE_SYSTEM, f"Message: {query}",
+                     max_new_tokens=100, decode_config=ROUTER_DECODE, stage_label="SCOPE_GATE")
+    parsed = safe_json_parse(raw)
+    scope  = str(parsed.get("scope", "IN_SCOPE")).strip().upper()
+    in_scope = scope != "OUT_OF_SCOPE"
+    print(f"[SCOPE_GATE] {scope} — {parsed.get('reasoning', '')}")
+    if not in_scope:
+        sec_logger.log_event("content_blocked", "info",
+                              detail={"stage": "scope_gate", "query": query[:500],
+                                      "reasoning": parsed.get("reasoning", "")})
+    return {**state, "in_scope": in_scope}
+
+
+def scope_refusal_node(state: GREAgentState) -> GREAgentState:
+    print("\n[NODE] SCOPE REFUSAL")
+    return {**state, "answer": SCOPE_REFUSAL_MESSAGE, "failed": False,
+            "out_of_scope": True, "route": "blocked"}
+
 
 def router_node(state: GREAgentState) -> GREAgentState:
     print("\n" + "="*60)
@@ -2415,6 +2508,16 @@ def sql_validation_node(state: GREAgentState) -> GREAgentState:
         validate_sql(sql)
         print("[VALIDATION] ✓ PASSED")
         return {**state, "sql_error": ""}
+    except SQLSecurityError as e:
+        # A security-guardrail rejection is not a fixable syntax mistake —
+        # see falcon_agent.py for the detailed rationale. Fail immediately
+        # with a deterministic refusal instead of retrying or falling back
+        # to run_llm_fallback, which previously produced hallucinated
+        # "success" narratives once retries were exhausted.
+        error = str(e)
+        print(f"[VALIDATION] ✗ SECURITY BLOCK → {error}")
+        sec_logger.log_event("sql_blocked", "warning", detail={"sql": sql[:500], "reason": error})
+        return {**state, "sql_error": error, "security_blocked": True}
     except Exception as e:
         error = str(e)
         print(f"[VALIDATION] ✗ FAILED → {error}")
@@ -2427,6 +2530,9 @@ def should_retry_sql(state: GREAgentState) -> str:
     retries = state.get("sql_retry_count", 0)
     if not error:
         return "execute"
+    if state.get("security_blocked"):
+        print("[ROUTER] SQL blocked by security guardrail → failing immediately (no retry)")
+        return "fail"
     if retries <= SQL_MAX_RETRIES:
         print(f"[ROUTER] SQL invalid → retrying ({retries}/{SQL_MAX_RETRIES})")
         return "retry"
@@ -2477,8 +2583,16 @@ def explanation_node(state: GREAgentState) -> GREAgentState:
     if error or df is None:
         return {**state, "answer": f"Query could not be executed. Error: {error or 'Unknown'}"}
 
+    # Per feedback from live testing: don't call the explanation LLM on an
+    # empty result set — it was observed inventing confident-sounding but
+    # fabricated commentary (and, in one case, offensive remarks) from
+    # nothing but zero rows. Only real data gets an LLM-written explanation.
+    if df.empty:
+        return {**state, "answer": "The query ran successfully but returned no matching records. "
+                                    "Try adjusting the filters or time range."}
+
     summary = summarize_dataframe(df)
-    
+
     # ── Steering compliance: cap Forbidden rows fed to the explanation LLM ──
     if route == "steering_q" and df is not None and "network_type" in df.columns:
         forbidden_df   = df[df["network_type"].str.contains("Forbidden", case=False, na=False)]
@@ -2526,6 +2640,8 @@ def failure_node(state: GREAgentState) -> GREAgentState:
 
 def build_gre_graph() -> StateGraph:
     graph = StateGraph(GREAgentState)
+    graph.add_node("scope_gate",     scope_gate_node)
+    graph.add_node("scope_refusal",  scope_refusal_node)
     graph.add_node("router",         router_node)
     graph.add_node("table_id",       table_id_node)
     graph.add_node("rag",            rag_node)
@@ -2536,7 +2652,13 @@ def build_gre_graph() -> StateGraph:
     graph.add_node("explanation",    explanation_node)
     graph.add_node("failure",        failure_node)
 
-    graph.set_entry_point("router")
+    graph.set_entry_point("scope_gate")
+    graph.add_conditional_edges(
+        "scope_gate",
+        lambda state: "router" if state.get("in_scope", True) else "scope_refusal",
+        {"router": "router", "scope_refusal": "scope_refusal"},
+    )
+    graph.add_edge("scope_refusal", END)
     graph.add_edge("router",         "table_id")
     graph.add_edge("table_id",       "rag")
     graph.add_edge("rag",            "cot_planner")
@@ -2581,8 +2703,24 @@ def run_query(user_query: str, model_name: str = MODEL,
         "failed":           False,
         "failure_reason":   "",
         "fallback_used":    False,
+        "security_blocked": False,
+        "in_scope":         True,
+        "out_of_scope":     False,
     }
     final: GREAgentState = gre_graph.invoke(initial)
+    if final.get("out_of_scope"):
+        # The scope gate already set a clean refusal in "answer" — never let
+        # the fallback chain pick this back up.
+        print("[ORCHESTRATOR] Out of scope — skipping fallback")
+        return final
+    if final.get("security_blocked"):
+        # See falcon_agent.py run_query() for the detailed rationale — never
+        # hand a security-guardrail rejection to the independent fallback
+        # chain, which has no memory of why the first attempt was blocked.
+        print("[ORCHESTRATOR] SQL blocked by security guardrail — skipping fallback")
+        final["answer"] = ("I can only answer read-only reporting questions against the approved "
+                            "roaming analytics data — I can't create, modify, or delete data.")
+        return final
     if use_fallback and (final.get("failed") or final.get("df") is None):
         print("[ORCHESTRATOR] Graph result empty/failed — triggering fallback")
         final = run_llm_fallback(user_query, final)
