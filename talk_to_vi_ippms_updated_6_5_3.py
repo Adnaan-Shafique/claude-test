@@ -5341,7 +5341,7 @@ def main_page(email: str, convs, active_cid, messages, feedback, pending):
                 html.Button("Sign out", id="logout-btn", n_clicks=0, className="logout"),
             ]),
         ]),
-        sidebar(convs, active_cid),
+        html.Div(id="sidebar-host", children=sidebar(convs, active_cid)),
         html.Div(className="main", children=[
             html.Div(className="scroll", children=[
                 html.Div(id="stream-host", children=render_stream(messages, feedback, pending))
@@ -5419,6 +5419,27 @@ def route_page(auth, feedback):
     main = main_page(sess["email"], convs, active_cid, msgs, feedback or {}, False)
     return (no_update, main, {"display": "none"}, {"display": "block"},
             msgs, convs, active_cid)
+
+
+# BUGFIX: main_page() only ever builds the sidebar's HTML once, when
+# route_page rebuilds the whole page (login, logout, or a page reload).
+# Every callback that changes which conversations exist or which one is
+# active (on_submit creating a new conversation, new_conv, switch_conv) was
+# already correctly writing sconvs/scid — but nothing turned that store
+# update into an actual re-render of the sidebar DOM, so a brand-new
+# conversation, or the highlight moving to a clicked one, only ever became
+# visible after something (a refresh/re-login) forced route_page to rebuild
+# the page from scratch. This callback is that missing re-render: it fires
+# on every sconvs/scid change, wherever it comes from, and keeps the sidebar
+# in sync without any of those other callbacks needing to change.
+@app.callback(
+    Output("sidebar-host", "children"),
+    Input("sconvs", "data"),
+    Input("scid", "data"),
+    prevent_initial_call=True,
+)
+def render_sidebar(convs, active_cid):
+    return sidebar(convs or [], active_cid)
 
 
 @app.callback(
