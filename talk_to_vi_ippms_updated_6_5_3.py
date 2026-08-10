@@ -907,28 +907,35 @@ def load_conversation_messages(conversation_id: Optional[int], session_key: str)
     return out
 
 
-def delete_conversation(conversation_id: Optional[int], session_key: str) -> None:
+def delete_conversation_if_empty(conversation_id: Optional[int], session_key: str) -> bool:
     """Immediate hard delete for an abandoned placeholder — created by New
     conversation, never sent a message — the moment the user navigates away
     from it (switch_conv) or logs out while sitting on one, rather than
-    waiting for the 7-day retention sweep to eventually clear it. Scoped by
-    session_key so this can never reach another user's conversation."""
+    waiting for the 7-day retention sweep to eventually clear it. Returns
+    True if it actually deleted something.
+
+    The "is it empty" test is done HERE against the database rather than
+    trusting the caller's in-browser message store: if a message load had
+    transiently failed, that store would be empty for a conversation that
+    really does have messages, and deleting on that basis would destroy real
+    history. The DELETE is guarded by a NOT EXISTS on the messages table so
+    only a genuinely empty conversation can ever be removed. Scoped by
+    session_key too, so this can never reach another user's conversation."""
     if conversation_id is None or not _ensure_conversation_tables():
-        return
+        return False
     try:
         with _log_cursor(commit=True) as cur:
             cur.execute(
-                f"""DELETE FROM {DB_SCHEMA}.vi_chat_messages
-                    WHERE conversation_id = %s AND session_key = %s""",
+                f"""DELETE FROM {DB_SCHEMA}.vi_chat_conversations c
+                    WHERE c.id = %s AND c.session_key = %s
+                      AND NOT EXISTS (SELECT 1 FROM {DB_SCHEMA}.vi_chat_messages m
+                                      WHERE m.conversation_id = c.id)""",
                 (conversation_id, session_key),
             )
-            cur.execute(
-                f"""DELETE FROM {DB_SCHEMA}.vi_chat_conversations
-                    WHERE id = %s AND session_key = %s""",
-                (conversation_id, session_key),
-            )
+            return bool(cur.rowcount)
     except Exception as exc:
-        log.warning("delete_conversation failed: %s", exc)
+        log.warning("delete_conversation_if_empty failed: %s", exc)
+        return False
 
 
 def _purge_expired_conversations() -> None:
@@ -5354,17 +5361,36 @@ def _fmt_conv_meta(ts: Any) -> str:
         return ""
 
 
-def sidebar(convs, active_cid):
-    conv_items = []
-    for c in convs:
+def conv_items(convs, active_cid):
+    """Just the clickable conversation rows. This is the ONLY part of the
+    sidebar that conversation-switching re-renders — see sidebar() below."""
+    items = []
+    for c in convs or []:
         cls = "s-item s-act" if c["cid"] == active_cid else "s-item"
-        conv_items.append(html.Div(className=cls, id={"type": "conv", "cid": c["cid"]}, n_clicks=0,
-                                   children=[html.Div(c["title"], className="s-ttl"),
-                                             html.Div(c["meta"], className="s-meta")]))
+        items.append(html.Div(className=cls, id={"type": "conv", "cid": c["cid"]}, n_clicks=0,
+                              children=[html.Div(c["title"], className="s-ttl"),
+                                        html.Div(c["meta"], className="s-meta")]))
+    return items
+
+
+def sidebar(convs, active_cid):
+    """BUGFIX: the "New conversation" button must stay OUTSIDE the subtree
+    that gets re-rendered when the conversation list/highlight changes.
+
+    It used to sit inside that subtree, so every sidebar refresh reinserted
+    the button as a brand-new component — and Dash fires a callback for a
+    freshly-inserted Input regardless of prevent_initial_call (the same quirk
+    the ops-console file's "App layout" note documents). new_conv therefore
+    ran on EVERY conversation switch: it wiped smsgs to [] (dropping the user
+    straight back to the welcome screen instead of the conversation they'd
+    just clicked) and minted a phantom "New conversation" row each time.
+
+    Only conv-list-host below is re-rendered now, so the button — and its
+    callback — are untouched by conversation switching."""
     return html.Div(className="sidebar", children=[
         html.Div("Conversations", className="s-hdr"),
         html.Button("＋  New conversation", id="new-conv", n_clicks=0, className="s-new"),
-        html.Div(conv_items, className="s-list"),
+        html.Div(conv_items(convs, active_cid), id="conv-list-host", className="s-list"),
     ])
 
 
@@ -5382,7 +5408,7 @@ def main_page(email: str, convs, active_cid, messages, feedback, pending):
                 html.Button("Sign out", id="logout-btn", n_clicks=0, className="logout"),
             ]),
         ]),
-        html.Div(id="sidebar-host", children=sidebar(convs, active_cid)),
+        sidebar(convs, active_cid),
         html.Div(className="main", children=[
             html.Div(className="scroll", children=[
                 html.Div(id="stream-host", children=render_stream(messages, feedback, pending))
@@ -5473,6 +5499,13 @@ def route_page(auth, feedback):
     prevent_initial_call=True,
 )
 def do_login(_n, _s1, _s2, email, eid):
+    # Same insert-fire guard as new_conv/do_logout: route_page re-renders the
+    # login view (on logout, and on the initial authenticated-check), which
+    # reinserts these inputs and fires this callback with everything at 0/None.
+    # Without this, the login page greeted the user with a "required" error
+    # before they had typed anything.
+    if not _n and not _s1 and not _s2:
+        return no_update, no_update
     email = (email or "").strip().lower()
     eid = (eid or "").strip()
     if not email or not eid:
@@ -5507,7 +5540,7 @@ def do_logout(_n, auth, cid, msgs):
     # never used) -> delete it now rather than leaving it for the retention
     # sweep to eventually clear.
     if sess and cid is not None and not msgs:
-        delete_conversation(cid, sess["email"])
+        delete_conversation_if_empty(cid, sess["email"])
     session_destroy((auth or {}).get("token"))
     return None, [], [], None, None
 
@@ -5554,7 +5587,7 @@ def on_send(_send, _quick, typed, msgs, feedback, auth):
     Output("sconvs", "data", allow_duplicate=True),
     Output("scid", "data", allow_duplicate=True),
     Output("sauth", "data", allow_duplicate=True),
-    Output("sidebar-host", "children", allow_duplicate=True),
+    Output("conv-list-host", "children", allow_duplicate=True),
     Input("spending", "data"),
     State("smsgs", "data"),
     State("sauth", "data"),
@@ -5613,7 +5646,7 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
                 c["meta"] = _fmt_conv_meta(datetime.now())
                 break
     return (msgs, None, render_stream(msgs, feedback or {}, False), convs, cid, no_update,
-            sidebar(convs, cid))
+            conv_items(convs, cid))
 
 
 @app.callback(
@@ -5621,7 +5654,7 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
     Output("scid", "data", allow_duplicate=True),
     Output("sconvs", "data", allow_duplicate=True),
     Output("stream-host", "children", allow_duplicate=True),
-    Output("sidebar-host", "children", allow_duplicate=True),
+    Output("conv-list-host", "children", allow_duplicate=True),
     Input("new-conv", "n_clicks"),
     State("smsgs", "data"),
     State("sconvs", "data"),
@@ -5630,6 +5663,13 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
     prevent_initial_call=True,
 )
 def new_conv(_n, msgs, convs, feedback, auth):
+    # n_clicks == 0 means this fired because the button was (re)inserted into
+    # the layout, not because anyone pressed it — Dash runs a callback for a
+    # freshly-inserted Input regardless of prevent_initial_call. Without this
+    # guard, any page rebuild silently minted a phantom conversation and reset
+    # the transcript. do_logout guards itself the same way.
+    if not _n:
+        return no_update, no_update, no_update, no_update, no_update
     sess = session_get((auth or {}).get("token"))
     if not sess:
         return no_update, no_update, no_update, no_update, no_update
@@ -5648,7 +5688,7 @@ def new_conv(_n, msgs, convs, feedback, auth):
     if cid is not None:
         convs = [{"cid": cid, "title": "New conversation",
                  "meta": _fmt_conv_meta(datetime.now())}] + convs
-    return [], cid, convs, render_stream([], feedback or {}, False), sidebar(convs, cid)
+    return [], cid, convs, render_stream([], feedback or {}, False), conv_items(convs, cid)
 
 
 @app.callback(
@@ -5803,7 +5843,7 @@ def on_csv_ts(_n, msgs):
     Output("smsgs", "data", allow_duplicate=True),
     Output("sconvs", "data", allow_duplicate=True),
     Output("stream-host", "children", allow_duplicate=True),
-    Output("sidebar-host", "children", allow_duplicate=True),
+    Output("conv-list-host", "children", allow_duplicate=True),
     Input({"type": "conv", "cid": ALL}, "n_clicks"),
     State("sfeedback", "data"),
     State("sauth", "data"),
@@ -5831,10 +5871,10 @@ def switch_conv(_n, feedback, auth, prev_cid, prev_msgs, convs):
     # different one -> delete it now instead of leaving it in the sidebar
     # until the retention sweep eventually clears it.
     if prev_cid is not None and prev_cid != cid and not prev_msgs:
-        delete_conversation(prev_cid, sess["email"])
-        convs = [c for c in convs if c["cid"] != prev_cid]
+        if delete_conversation_if_empty(prev_cid, sess["email"]):
+            convs = [c for c in convs if c["cid"] != prev_cid]
     msgs = load_conversation_messages(cid, sess["email"])
-    return cid, msgs, convs, render_stream(msgs, feedback or {}, False), sidebar(convs, cid)
+    return cid, msgs, convs, render_stream(msgs, feedback or {}, False), conv_items(convs, cid)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
