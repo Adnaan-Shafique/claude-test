@@ -234,6 +234,13 @@ DB_PASSWORD = os.environ.get("VI_DB_PASSWORD", os.environ.get("IG_DB_PASSWORD", 
 DB_SCHEMA   = os.environ.get("VI_DB_SCHEMA", os.environ.get("IG_DB_SCHEMA", "tt_vi_ippms_schema"))
 DB_CONNECT_TIMEOUT = int(os.environ.get("VI_DB_CONNECT_TIMEOUT", "5"))
 
+# Persisted chat history (sidebar conversations, §4.4): how long a conversation
+# is kept after its last activity before a background sweep hard-deletes it
+# (and its messages) from Postgres, and how often that sweep runs.
+CHAT_HISTORY_RETENTION_DAYS  = int(os.environ.get("VI_CHAT_HISTORY_RETENTION_DAYS", "7"))
+CHAT_HISTORY_SWEEP_INTERVAL  = int(os.environ.get("VI_CHAT_HISTORY_SWEEP_INTERVAL", str(6 * 3600)))
+CHAT_HISTORY_MAX_CONVS       = int(os.environ.get("VI_CHAT_HISTORY_MAX_CONVS", "100"))
+
 # Decode presets per graph role (mirrors gpu_llm_context.py).
 # SYNTHESIS is now temperature 0.0 (was 0.3): the query-spec engine makes the
 # retrieved DATA deterministic; setting synthesis to 0.0 makes the phrasing as
@@ -696,6 +703,241 @@ def log_user_feedback(interaction_id: Optional[int], session_key: str, feedback_
             )
     except Exception as exc:
         log.warning("log_user_feedback failed: %s", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4B-2 — PERSISTED CHAT HISTORY  (sidebar conversations, 7-day retention)
+# ══════════════════════════════════════════════════════════════════════════════
+#  smsgs/sconvs/scid are memory-only dcc.Stores — they do NOT survive a page
+#  reload, only a fresh login used to repopulate them, which is why history
+#  used to disappear even mid-session. These two tables are the durable copy:
+#  vi_chat_conversations is one row per conversation (sidebar entry, keyed by
+#  session_key/email), vi_chat_messages is one row per chat bubble (user
+#  question, or the FULL assistant `result` dict as JSONB) under it. Storing
+#  the whole result — not just the answer text — means reopening an old
+#  conversation is byte-identical to the original: charts render, tables still
+#  sort/filter, Download CSV and the feedback buttons keep working.
+#
+#  Kept on their own independent best-effort gate (own flag/lock, own DDL,
+#  never bundled into _ensure_logging_tables()'s transaction) for the same
+#  reason as _ensure_user_feedback_table(): a problem creating THESE tables
+#  must never roll back and disable the unrelated vi_chat_interactions/
+#  vi_chat_feedback logging that already works. No FOREIGN KEY constraints for
+#  the same reason too — the app's DB role may not hold REFERENCES on tables it
+#  didn't create; interaction_id is an application-level join only.
+
+_CONVERSATIONS_DDL = f"""
+CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_chat_conversations (
+    id             BIGSERIAL PRIMARY KEY,
+    session_key    TEXT NOT NULL,
+    title          TEXT NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_active_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+_CONVERSATIONS_IDX_DDL = f"""
+CREATE INDEX IF NOT EXISTS vi_chat_conversations_session_idx
+    ON {DB_SCHEMA}.vi_chat_conversations (session_key, last_active_at DESC);
+"""
+_CHAT_MESSAGES_DDL = f"""
+CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_chat_messages (
+    id              BIGSERIAL PRIMARY KEY,
+    conversation_id BIGINT NOT NULL,
+    session_key     TEXT NOT NULL,
+    role            TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    content         TEXT,
+    result          JSONB,
+    interaction_id  BIGINT
+);
+"""
+_CHAT_MESSAGES_IDX_DDL = f"""
+CREATE INDEX IF NOT EXISTS vi_chat_messages_conv_idx
+    ON {DB_SCHEMA}.vi_chat_messages (conversation_id, created_at);
+"""
+
+_conversation_tables_ready = False
+_conversation_tables_ready_lock = threading.Lock()
+
+
+def _ensure_conversation_tables() -> bool:
+    global _conversation_tables_ready
+    if _conversation_tables_ready:
+        return True
+    with _conversation_tables_ready_lock:
+        if _conversation_tables_ready:
+            return True
+        if not DB_PASSWORD:
+            return False
+        try:
+            with _log_cursor(commit=True) as cur:
+                cur.execute(_CONVERSATIONS_DDL)
+                cur.execute(_CONVERSATIONS_IDX_DDL)
+                cur.execute(_CHAT_MESSAGES_DDL)
+                cur.execute(_CHAT_MESSAGES_IDX_DDL)
+            _conversation_tables_ready = True
+            log.info("[STARTUP] chat history tables ready (retention=%sd).",
+                     CHAT_HISTORY_RETENTION_DAYS)
+            return True
+        except Exception as exc:
+            log.warning("Could not ensure chat history tables (persisted conversation "
+                        "history disabled): %s", exc)
+            return False
+
+
+def create_conversation(session_key: str, title: str) -> Optional[int]:
+    """Mint a new conversation row for the FIRST message of a new thread.
+    Returns its id (used as `cid` client-side), or None if persistence is
+    unavailable — callers treat that as best-effort and keep working in
+    memory-only mode for that turn."""
+    if not _ensure_conversation_tables():
+        return None
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""INSERT INTO {DB_SCHEMA}.vi_chat_conversations (session_key, title)
+                    VALUES (%s, %s) RETURNING id""",
+                (session_key, (title or "New conversation")[:120]),
+            )
+            row = cur.fetchone()
+            return int(row["id"]) if row else None
+    except Exception as exc:
+        log.warning("create_conversation failed: %s", exc)
+        return None
+
+
+def touch_conversation(conversation_id: Optional[int]) -> None:
+    """Bump last_active_at so the conversation sorts to the top of the
+    sidebar and its retention clock restarts from this latest turn."""
+    if conversation_id is None or not _ensure_conversation_tables():
+        return
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"UPDATE {DB_SCHEMA}.vi_chat_conversations SET last_active_at = now() WHERE id = %s",
+                (conversation_id,),
+            )
+    except Exception as exc:
+        log.warning("touch_conversation failed: %s", exc)
+
+
+def save_message(conversation_id: Optional[int], session_key: str, role: str,
+                 content: Optional[str] = None, result: Optional[Dict[str, Any]] = None,
+                 interaction_id: Optional[int] = None) -> None:
+    if conversation_id is None or not _ensure_conversation_tables():
+        return
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""INSERT INTO {DB_SCHEMA}.vi_chat_messages
+                    (conversation_id, session_key, role, content, result, interaction_id)
+                    VALUES (%s,%s,%s,%s,%s,%s)""",
+                (conversation_id, session_key, role, content,
+                 json.dumps(result, default=str) if result is not None else None,
+                 interaction_id),
+            )
+    except Exception as exc:
+        log.warning("save_message failed: %s", exc)
+
+
+def list_conversations(session_key: str, limit: int = CHAT_HISTORY_MAX_CONVS) -> List[Dict[str, Any]]:
+    """Conversations for the sidebar, most-recently-active first. The
+    `last_active_at > now() - retention` filter is applied here too (not just
+    by the background sweep) so a conversation that aged out between sweeps
+    never flashes into a freshly (re)loaded session."""
+    if not _ensure_conversation_tables():
+        return []
+    try:
+        with _log_cursor() as cur:
+            cur.execute(
+                f"""SELECT id, title, last_active_at FROM {DB_SCHEMA}.vi_chat_conversations
+                    WHERE session_key = %s
+                      AND last_active_at > now() - interval '{CHAT_HISTORY_RETENTION_DAYS} days'
+                    ORDER BY last_active_at DESC LIMIT %s""",
+                (session_key, limit),
+            )
+            return cur.fetchall() or []
+    except Exception as exc:
+        log.warning("list_conversations failed: %s", exc)
+        return []
+
+
+def load_conversation_messages(conversation_id: Optional[int], session_key: str) -> List[Dict[str, Any]]:
+    """Rebuild the in-memory `smsgs` shape (role/content for user turns,
+    role/result for assistant turns — same shape render_stream already
+    expects) for one conversation. Scoped by session_key too, so one user can
+    never load another's conversation by guessing/tampering with an id."""
+    if conversation_id is None or not _ensure_conversation_tables():
+        return []
+    try:
+        with _log_cursor() as cur:
+            cur.execute(
+                f"""SELECT role, content, result FROM {DB_SCHEMA}.vi_chat_messages
+                    WHERE conversation_id = %s AND session_key = %s
+                    ORDER BY id""",
+                (conversation_id, session_key),
+            )
+            rows = cur.fetchall() or []
+    except Exception as exc:
+        log.warning("load_conversation_messages failed: %s", exc)
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if r["role"] == "user":
+            out.append({"role": "user", "content": r["content"]})
+        else:
+            out.append({"role": "assistant", "result": r["result"] or {}})
+    return out
+
+
+def _purge_expired_conversations() -> None:
+    """Hard-delete conversations (and their messages) inactive for more than
+    CHAT_HISTORY_RETENTION_DAYS. A whole conversation expires together, based
+    on when it was last active (not per-message), so an older thread that's
+    still being actively used doesn't lose its earlier turns out from under
+    it just because the thread itself is old."""
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""DELETE FROM {DB_SCHEMA}.vi_chat_messages WHERE conversation_id IN (
+                        SELECT id FROM {DB_SCHEMA}.vi_chat_conversations
+                        WHERE last_active_at < now() - interval '{CHAT_HISTORY_RETENTION_DAYS} days')"""
+            )
+            cur.execute(
+                f"""DELETE FROM {DB_SCHEMA}.vi_chat_conversations
+                    WHERE last_active_at < now() - interval '{CHAT_HISTORY_RETENTION_DAYS} days'"""
+            )
+    except Exception as exc:
+        log.warning("Chat history retention purge failed: %s", exc)
+
+
+_retention_thread_started = False
+_retention_thread_lock = threading.Lock()
+
+
+def _retention_sweep_loop() -> None:
+    while True:
+        if _ensure_conversation_tables():
+            _purge_expired_conversations()
+        time.sleep(CHAT_HISTORY_SWEEP_INTERVAL)
+
+
+def _ensure_retention_sweeper() -> None:
+    """Start the background purge thread once (mirrors the TokenManager
+    watchdog / tool-call-audit-writer daemon-thread pattern already used
+    elsewhere in this stack). Runs a sweep immediately on start, then every
+    CHAT_HISTORY_SWEEP_INTERVAL seconds."""
+    global _retention_thread_started
+    if _retention_thread_started:
+        return
+    with _retention_thread_lock:
+        if _retention_thread_started:
+            return
+        threading.Thread(target=_retention_sweep_loop, name="vi-chat-history-retention",
+                         daemon=True).start()
+        _retention_thread_started = True
+        log.info("Chat history retention sweeper started (every %ss, keeps %sd).",
+                 CHAT_HISTORY_SWEEP_INTERVAL, CHAT_HISTORY_RETENTION_DAYS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5060,6 +5302,17 @@ def feedback_modal(index: int):
 
 # ── Main app layout ──────────────────────────────────────────────────────────
 
+def _fmt_conv_meta(ts: Any) -> str:
+    """Sidebar's small secondary line under a conversation title — when this
+    conversation was last active, e.g. 'Aug 10, 09:15'."""
+    try:
+        if isinstance(ts, str):
+            ts = datetime.fromisoformat(ts)
+        return ts.strftime("%b %d, %H:%M")
+    except Exception:      # noqa: BLE001
+        return ""
+
+
 def sidebar(convs, active_cid):
     conv_items = []
     for c in convs:
@@ -5138,16 +5391,34 @@ app.layout = html.Div([
     Output("main-view", "children"),
     Output("login-view", "style"),
     Output("main-view", "style"),
+    Output("smsgs", "data"),
+    Output("sconvs", "data"),
+    Output("scid", "data"),
     Input("sauth", "data"),
-    State("smsgs", "data"), State("sconvs", "data"), State("scid", "data"),
-    State("sfeedback", "data"), State("spending", "data"),
+    State("sfeedback", "data"),
 )
-def route_page(auth, msgs, convs, cid, feedback, pending):
+def route_page(auth, feedback):
     sess = session_get((auth or {}).get("token"))
     if not sess:
-        return login_page(), no_update, {"display": "block"}, {"display": "none"}
-    main = main_page(sess["email"], convs or [], cid, msgs or [], feedback or {}, bool(pending))
-    return no_update, main, {"display": "none"}, {"display": "block"}
+        return (login_page(), no_update, {"display": "block"}, {"display": "none"},
+                no_update, no_update, no_update)
+    # Reload this user's persisted chat history every time we land here
+    # authenticated — a fresh login AND a plain page refresh both go through
+    # here (sauth uses session storage and survives a reload; smsgs/sconvs/
+    # scid are memory-only and do NOT, which is exactly why history used to
+    # vanish even mid-session, not just after a real re-login). Auto-open the
+    # most recent conversation so returning users land back where they left
+    # off instead of a blank welcome screen.
+    convs = [{"cid": c["id"], "title": c["title"], "meta": _fmt_conv_meta(c["last_active_at"])}
+             for c in list_conversations(sess["email"])]
+    if convs:
+        active_cid = convs[0]["cid"]
+        msgs = load_conversation_messages(active_cid, sess["email"])
+    else:
+        active_cid, msgs = None, []
+    main = main_page(sess["email"], convs, active_cid, msgs, feedback or {}, False)
+    return (no_update, main, {"display": "none"}, {"display": "block"},
+            msgs, convs, active_cid)
 
 
 @app.callback(
@@ -5249,23 +5520,34 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
     if not sess:
         return no_update, None, no_update, no_update, no_update, None
     q = pending["q"]
+    email = sess["email"]
+
+    # First message of a brand-new conversation -> mint a real, persisted row
+    # so subsequent messages (and a future login) have something durable to
+    # attach to. If persistence is unavailable, cid stays None and this turn
+    # simply isn't saved (best-effort, same as every other logging call here)
+    # — the chat itself keeps working either way.
+    convs = convs or []
+    if not cid:
+        cid = create_conversation(email, q[:42])
+        if cid is not None:
+            convs = [{"cid": cid, "title": q[:42], "meta": _fmt_conv_meta(datetime.now())}] + convs
+
     try:
-        result = pipeline(q, sess["email"])
+        result = pipeline(q, email)
     except Exception as exc:
         log.exception("pipeline crashed")
         result = {"answer": f"Unexpected error: {exc}", "route": "", "error": True,
                   "trace": [], "timing": {"total": 0}}
     msgs = (msgs or []) + [{"role": "assistant", "result": result}]
 
-    # Conversation bookkeeping.
-    convs = convs or []
-    if not cid:
-        cid = _sha256(q + str(time.time()))[:10]
-        convs = [{"cid": cid, "title": q[:42], "meta": ROUTE_LABEL.get(result.get("route"), "")}] + convs
-    else:
+    if cid is not None:
+        save_message(cid, email, "user", content=q)
+        save_message(cid, email, "assistant", result=result, interaction_id=result.get("interaction_id"))
+        touch_conversation(cid)
         for c in convs:
             if c["cid"] == cid:
-                c["meta"] = ROUTE_LABEL.get(result.get("route"), c.get("meta", ""))
+                c["meta"] = _fmt_conv_meta(datetime.now())
                 break
     return msgs, None, render_stream(msgs, feedback or {}, False), convs, cid, no_update
 
@@ -5434,15 +5716,29 @@ def on_csv_ts(_n, msgs):
 
 @app.callback(
     Output("scid", "data", allow_duplicate=True),
+    Output("smsgs", "data", allow_duplicate=True),
+    Output("stream-host", "children", allow_duplicate=True),
     Input({"type": "conv", "cid": ALL}, "n_clicks"),
+    State("sfeedback", "data"),
+    State("sauth", "data"),
     prevent_initial_call=True,
 )
-def switch_conv(_n):
+def switch_conv(_n, feedback, auth):
+    # BUGFIX: this used to only set scid — clicking a conversation in the
+    # sidebar changed which one was highlighted but never actually loaded
+    # ITS messages, so the transcript shown never changed. Now it pulls that
+    # conversation's messages fresh from Postgres, same as opening it after
+    # login.
     trig = ctx.triggered_id
     clicked = [i["value"] for i in ctx.inputs_list[0]]
     if not isinstance(trig, dict) or not any((n or 0) > 0 for n in clicked):
-        return no_update
-    return trig["cid"]
+        return no_update, no_update, no_update
+    sess = session_get((auth or {}).get("token"))
+    if not sess:
+        return no_update, no_update, no_update
+    cid = trig["cid"]
+    msgs = load_conversation_messages(cid, sess["email"])
+    return cid, msgs, render_stream(msgs, feedback or {}, False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5463,11 +5759,14 @@ def _warm_startup():
     _load_question_guide()          # build the local RAG index (§4.2D)
     _ensure_logging_tables()        # best-effort create vi_chat_* tables (§3.5)
     _ensure_user_feedback_table()   # best-effort create user_feedback, independently
+    _ensure_conversation_tables()   # best-effort create chat history tables, independently
+    _ensure_retention_sweeper()     # start the 7-day retention purge thread
     log.info("[STARTUP] tool KB %s, question guide %d rows, logging %s, "
-             "user_feedback %s.",
+             "user_feedback %s, chat_history %s.",
              "loaded" if TOOL_KB_TEXT else "MISSING", len(_GUIDE_ROWS),
              "ready" if _logging_ready else "disabled",
-             "ready" if _user_feedback_ready else "disabled")
+             "ready" if _user_feedback_ready else "disabled",
+             "ready" if _conversation_tables_ready else "disabled")
 
 
 if __name__ == "__main__":
