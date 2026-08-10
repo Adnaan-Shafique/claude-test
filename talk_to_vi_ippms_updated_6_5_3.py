@@ -5462,27 +5462,6 @@ def route_page(auth, feedback):
             msgs, convs, active_cid)
 
 
-# BUGFIX: main_page() only ever builds the sidebar's HTML once, when
-# route_page rebuilds the whole page (login, logout, or a page reload).
-# Every callback that changes which conversations exist or which one is
-# active (on_submit creating a new conversation, new_conv, switch_conv) was
-# already correctly writing sconvs/scid — but nothing turned that store
-# update into an actual re-render of the sidebar DOM, so a brand-new
-# conversation, or the highlight moving to a clicked one, only ever became
-# visible after something (a refresh/re-login) forced route_page to rebuild
-# the page from scratch. This callback is that missing re-render: it fires
-# on every sconvs/scid change, wherever it comes from, and keeps the sidebar
-# in sync without any of those other callbacks needing to change.
-@app.callback(
-    Output("sidebar-host", "children"),
-    Input("sconvs", "data"),
-    Input("scid", "data"),
-    prevent_initial_call=True,
-)
-def render_sidebar(convs, active_cid):
-    return sidebar(convs or [], active_cid)
-
-
 @app.callback(
     Output("sauth", "data"),
     Output("login-error", "children"),
@@ -5575,6 +5554,7 @@ def on_send(_send, _quick, typed, msgs, feedback, auth):
     Output("sconvs", "data", allow_duplicate=True),
     Output("scid", "data", allow_duplicate=True),
     Output("sauth", "data", allow_duplicate=True),
+    Output("sidebar-host", "children", allow_duplicate=True),
     Input("spending", "data"),
     State("smsgs", "data"),
     State("sauth", "data"),
@@ -5585,10 +5565,10 @@ def on_send(_send, _quick, typed, msgs, feedback, auth):
 )
 def on_submit(pending, msgs, auth, convs, cid, feedback):
     if not pending or not pending.get("q"):
-        return no_update, no_update, no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update, no_update, no_update
     sess = session_get((auth or {}).get("token"))
     if not sess:
-        return no_update, None, no_update, no_update, no_update, None
+        return no_update, None, no_update, no_update, no_update, None, no_update
     q = pending["q"]
     email = sess["email"]
     # msgs already has this turn's user question appended (on_send did that
@@ -5632,7 +5612,8 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
             if c["cid"] == cid:
                 c["meta"] = _fmt_conv_meta(datetime.now())
                 break
-    return msgs, None, render_stream(msgs, feedback or {}, False), convs, cid, no_update
+    return (msgs, None, render_stream(msgs, feedback or {}, False), convs, cid, no_update,
+            sidebar(convs, cid))
 
 
 @app.callback(
@@ -5640,6 +5621,7 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
     Output("scid", "data", allow_duplicate=True),
     Output("sconvs", "data", allow_duplicate=True),
     Output("stream-host", "children", allow_duplicate=True),
+    Output("sidebar-host", "children", allow_duplicate=True),
     Input("new-conv", "n_clicks"),
     State("smsgs", "data"),
     State("sconvs", "data"),
@@ -5650,13 +5632,13 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
 def new_conv(_n, msgs, convs, feedback, auth):
     sess = session_get((auth or {}).get("token"))
     if not sess:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
     # Already sitting on an empty conversation (a placeholder from an
     # earlier click nothing was ever sent in, or a brand-new tab with no
     # history at all) — nothing to do, avoids piling up empty "New
     # conversation" rows from repeated clicks.
     if not msgs:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
     # Mint the placeholder up front (not lazily on first message) so it's
     # visible in the sidebar immediately, matching every other conversation
     # switch. Renamed from its generic title once a real question is sent
@@ -5666,7 +5648,7 @@ def new_conv(_n, msgs, convs, feedback, auth):
     if cid is not None:
         convs = [{"cid": cid, "title": "New conversation",
                  "meta": _fmt_conv_meta(datetime.now())}] + convs
-    return [], cid, convs, render_stream([], feedback or {}, False)
+    return [], cid, convs, render_stream([], feedback or {}, False), sidebar(convs, cid)
 
 
 @app.callback(
@@ -5821,6 +5803,7 @@ def on_csv_ts(_n, msgs):
     Output("smsgs", "data", allow_duplicate=True),
     Output("sconvs", "data", allow_duplicate=True),
     Output("stream-host", "children", allow_duplicate=True),
+    Output("sidebar-host", "children", allow_duplicate=True),
     Input({"type": "conv", "cid": ALL}, "n_clicks"),
     State("sfeedback", "data"),
     State("sauth", "data"),
@@ -5838,10 +5821,10 @@ def switch_conv(_n, feedback, auth, prev_cid, prev_msgs, convs):
     trig = ctx.triggered_id
     clicked = [i["value"] for i in ctx.inputs_list[0]]
     if not isinstance(trig, dict) or not any((n or 0) > 0 for n in clicked):
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
     sess = session_get((auth or {}).get("token"))
     if not sess:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
     cid = trig["cid"]
     convs = convs or []
     # Leaving an empty placeholder (New conversation, never used) for a
@@ -5851,7 +5834,7 @@ def switch_conv(_n, feedback, auth, prev_cid, prev_msgs, convs):
         delete_conversation(prev_cid, sess["email"])
         convs = [c for c in convs if c["cid"] != prev_cid]
     msgs = load_conversation_messages(cid, sess["email"])
-    return cid, msgs, convs, render_stream(msgs, feedback or {}, False)
+    return cid, msgs, convs, render_stream(msgs, feedback or {}, False), sidebar(convs, cid)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
