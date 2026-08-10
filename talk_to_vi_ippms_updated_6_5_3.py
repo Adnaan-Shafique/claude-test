@@ -528,10 +528,14 @@ CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_chat_feedback (
 # feedback popup). Kept separate from vi_chat_feedback (which stays just the
 # simple up/down tally) — interaction_id is the join back to
 # vi_chat_interactions for the question/answer/etc. this feedback is about.
+# Deliberately NOT a DB-level FOREIGN KEY: creating one requires the REFERENCES
+# privilege on vi_chat_interactions, which the app's DB role may not have if
+# that table was provisioned by a different (more privileged) role — the join
+# still works fine for reporting without a DB-enforced constraint.
 _USER_FEEDBACK_DDL = f"""
 CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.user_feedback (
     id             BIGSERIAL PRIMARY KEY,
-    interaction_id BIGINT REFERENCES {DB_SCHEMA}.vi_chat_interactions(id),
+    interaction_id BIGINT,
     session_key    TEXT NOT NULL,
     feedback_text  TEXT NOT NULL,
     submitted_at   TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -595,12 +599,42 @@ def _ensure_logging_tables() -> bool:
             with _log_cursor(commit=True) as cur:
                 cur.execute(_INTERACTIONS_DDL)
                 cur.execute(_FEEDBACK_DDL)
-                cur.execute(_USER_FEEDBACK_DDL)
             _logging_ready = True
             log.info("[STARTUP] chat interaction/feedback tables ready.")
             return True
         except Exception as exc:
             log.warning("Could not ensure chat logging tables (logging disabled): %s", exc)
+            return False
+
+
+_user_feedback_ready = False
+_user_feedback_ready_lock = threading.Lock()
+
+
+def _ensure_user_feedback_table() -> bool:
+    """Best-effort CREATE ... IF NOT EXISTS for user_feedback, kept fully
+    independent of _ensure_logging_tables()/_logging_ready: both run inside
+    one transaction each, so if this table's DDL ever fails (e.g. a DB role
+    without CREATE on the schema) it must not roll back — and therefore
+    disable — the unrelated vi_chat_interactions/vi_chat_feedback logging
+    that already works today."""
+    global _user_feedback_ready
+    if _user_feedback_ready:
+        return True
+    with _user_feedback_ready_lock:
+        if _user_feedback_ready:
+            return True
+        if not DB_PASSWORD:
+            return False
+        try:
+            with _log_cursor(commit=True) as cur:
+                cur.execute(_USER_FEEDBACK_DDL)
+            _user_feedback_ready = True
+            log.info("[STARTUP] user_feedback table ready.")
+            return True
+        except Exception as exc:
+            log.warning("Could not ensure user_feedback table (downvote free-text "
+                        "logging disabled): %s", exc)
             return False
 
 
@@ -651,7 +685,7 @@ def log_user_feedback(interaction_id: Optional[int], session_key: str, feedback_
     Best-effort like every other logging call here: a DB outage never blocks
     the UI, it just means this particular note wasn't captured."""
     feedback_text = (feedback_text or "").strip()
-    if not feedback_text or not _ensure_logging_tables():
+    if not feedback_text or not _ensure_user_feedback_table():
         return
     try:
         with _log_cursor(commit=True) as cur:
@@ -5428,9 +5462,12 @@ def _warm_startup():
     _warm_tools()
     _load_question_guide()          # build the local RAG index (§4.2D)
     _ensure_logging_tables()        # best-effort create vi_chat_* tables (§3.5)
-    log.info("[STARTUP] tool KB %s, question guide %d rows, logging %s.",
+    _ensure_user_feedback_table()   # best-effort create user_feedback, independently
+    log.info("[STARTUP] tool KB %s, question guide %d rows, logging %s, "
+             "user_feedback %s.",
              "loaded" if TOOL_KB_TEXT else "MISSING", len(_GUIDE_ROWS),
-             "ready" if _logging_ready else "disabled")
+             "ready" if _logging_ready else "disabled",
+             "ready" if _user_feedback_ready else "disabled")
 
 
 if __name__ == "__main__":
