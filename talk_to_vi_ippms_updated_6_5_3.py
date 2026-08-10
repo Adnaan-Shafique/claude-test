@@ -907,6 +907,30 @@ def load_conversation_messages(conversation_id: Optional[int], session_key: str)
     return out
 
 
+def delete_conversation(conversation_id: Optional[int], session_key: str) -> None:
+    """Immediate hard delete for an abandoned placeholder — created by New
+    conversation, never sent a message — the moment the user navigates away
+    from it (switch_conv) or logs out while sitting on one, rather than
+    waiting for the 7-day retention sweep to eventually clear it. Scoped by
+    session_key so this can never reach another user's conversation."""
+    if conversation_id is None or not _ensure_conversation_tables():
+        return
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""DELETE FROM {DB_SCHEMA}.vi_chat_messages
+                    WHERE conversation_id = %s AND session_key = %s""",
+                (conversation_id, session_key),
+            )
+            cur.execute(
+                f"""DELETE FROM {DB_SCHEMA}.vi_chat_conversations
+                    WHERE id = %s AND session_key = %s""",
+                (conversation_id, session_key),
+            )
+    except Exception as exc:
+        log.warning("delete_conversation failed: %s", exc)
+
+
 def _purge_expired_conversations() -> None:
     """Hard-delete conversations (and their messages) inactive for more than
     CHAT_HISTORY_RETENTION_DAYS. A whole conversation expires together, based
@@ -5492,11 +5516,19 @@ def do_login(_n, _s1, _s2, email, eid):
     Output("sfbmodal", "data", allow_duplicate=True),
     Input("logout-btn", "n_clicks"),
     State("sauth", "data"),
+    State("scid", "data"),
+    State("smsgs", "data"),
     prevent_initial_call=True,
 )
-def do_logout(_n, auth):
+def do_logout(_n, auth, cid, msgs):
     if not _n:
         return no_update, no_update, no_update, no_update, no_update
+    sess = session_get((auth or {}).get("token"))
+    # Signing out while sitting on an empty placeholder (New conversation,
+    # never used) -> delete it now rather than leaving it for the retention
+    # sweep to eventually clear.
+    if sess and cid is not None and not msgs:
+        delete_conversation(cid, sess["email"])
     session_destroy((auth or {}).get("token"))
     return None, [], [], None, None
 
@@ -5787,13 +5819,17 @@ def on_csv_ts(_n, msgs):
 @app.callback(
     Output("scid", "data", allow_duplicate=True),
     Output("smsgs", "data", allow_duplicate=True),
+    Output("sconvs", "data", allow_duplicate=True),
     Output("stream-host", "children", allow_duplicate=True),
     Input({"type": "conv", "cid": ALL}, "n_clicks"),
     State("sfeedback", "data"),
     State("sauth", "data"),
+    State("scid", "data"),
+    State("smsgs", "data"),
+    State("sconvs", "data"),
     prevent_initial_call=True,
 )
-def switch_conv(_n, feedback, auth):
+def switch_conv(_n, feedback, auth, prev_cid, prev_msgs, convs):
     # BUGFIX: this used to only set scid — clicking a conversation in the
     # sidebar changed which one was highlighted but never actually loaded
     # ITS messages, so the transcript shown never changed. Now it pulls that
@@ -5802,13 +5838,20 @@ def switch_conv(_n, feedback, auth):
     trig = ctx.triggered_id
     clicked = [i["value"] for i in ctx.inputs_list[0]]
     if not isinstance(trig, dict) or not any((n or 0) > 0 for n in clicked):
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     sess = session_get((auth or {}).get("token"))
     if not sess:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     cid = trig["cid"]
+    convs = convs or []
+    # Leaving an empty placeholder (New conversation, never used) for a
+    # different one -> delete it now instead of leaving it in the sidebar
+    # until the retention sweep eventually clears it.
+    if prev_cid is not None and prev_cid != cid and not prev_msgs:
+        delete_conversation(prev_cid, sess["email"])
+        convs = [c for c in convs if c["cid"] != prev_cid]
     msgs = load_conversation_messages(cid, sess["email"])
-    return cid, msgs, render_stream(msgs, feedback or {}, False)
+    return cid, msgs, convs, render_stream(msgs, feedback or {}, False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
