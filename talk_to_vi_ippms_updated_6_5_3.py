@@ -821,6 +821,23 @@ def touch_conversation(conversation_id: Optional[int]) -> None:
         log.warning("touch_conversation failed: %s", exc)
 
 
+def rename_conversation(conversation_id: Optional[int], title: str) -> None:
+    """Replace a placeholder conversation's generic title (e.g. "New
+    conversation", set the moment the user clicked the New conversation
+    button, before they'd typed anything) with the real first question once
+    they actually send one."""
+    if conversation_id is None or not _ensure_conversation_tables():
+        return
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"UPDATE {DB_SCHEMA}.vi_chat_conversations SET title = %s WHERE id = %s",
+                ((title or "New conversation")[:120], conversation_id),
+            )
+    except Exception as exc:
+        log.warning("rename_conversation failed: %s", exc)
+
+
 def save_message(conversation_id: Optional[int], session_key: str, role: str,
                  content: Optional[str] = None, result: Optional[Dict[str, Any]] = None,
                  interaction_id: Optional[int] = None) -> None:
@@ -5542,17 +5559,30 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
         return no_update, None, no_update, no_update, no_update, None
     q = pending["q"]
     email = sess["email"]
+    # msgs already has this turn's user question appended (on_send did that
+    # before triggering this callback), so exactly 1 means it's the very
+    # first message of whatever conversation is currently active.
+    is_first_message = len(msgs or []) <= 1
 
-    # First message of a brand-new conversation -> mint a real, persisted row
-    # so subsequent messages (and a future login) have something durable to
-    # attach to. If persistence is unavailable, cid stays None and this turn
-    # simply isn't saved (best-effort, same as every other logging call here)
-    # — the chat itself keeps working either way.
     convs = convs or []
     if not cid:
+        # No conversation at all yet (e.g. the very first message in a brand
+        # new browser tab, bypassing New conversation entirely) -> mint one
+        # now, titled from the real question. If persistence is unavailable,
+        # cid stays None and this turn simply isn't saved (best-effort, same
+        # as every other logging call here) — the chat keeps working either way.
         cid = create_conversation(email, q[:42])
         if cid is not None:
             convs = [{"cid": cid, "title": q[:42], "meta": _fmt_conv_meta(datetime.now())}] + convs
+    elif is_first_message:
+        # cid already exists as an empty "New conversation" placeholder
+        # (from clicking the New conversation button) — this is its first
+        # real message, so replace the generic placeholder title.
+        rename_conversation(cid, q[:42])
+        for c in convs:
+            if c["cid"] == cid:
+                c["title"] = q[:42]
+                break
 
     try:
         result = pipeline(q, email)
@@ -5576,16 +5606,35 @@ def on_submit(pending, msgs, auth, convs, cid, feedback):
 @app.callback(
     Output("smsgs", "data", allow_duplicate=True),
     Output("scid", "data", allow_duplicate=True),
+    Output("sconvs", "data", allow_duplicate=True),
     Output("stream-host", "children", allow_duplicate=True),
     Input("new-conv", "n_clicks"),
+    State("smsgs", "data"),
+    State("sconvs", "data"),
     State("sfeedback", "data"),
     State("sauth", "data"),
     prevent_initial_call=True,
 )
-def new_conv(_n, feedback, auth):
-    if not session_get((auth or {}).get("token")):
-        return no_update, no_update, no_update
-    return [], None, render_stream([], feedback or {}, False)
+def new_conv(_n, msgs, convs, feedback, auth):
+    sess = session_get((auth or {}).get("token"))
+    if not sess:
+        return no_update, no_update, no_update, no_update
+    # Already sitting on an empty conversation (a placeholder from an
+    # earlier click nothing was ever sent in, or a brand-new tab with no
+    # history at all) — nothing to do, avoids piling up empty "New
+    # conversation" rows from repeated clicks.
+    if not msgs:
+        return no_update, no_update, no_update, no_update
+    # Mint the placeholder up front (not lazily on first message) so it's
+    # visible in the sidebar immediately, matching every other conversation
+    # switch. Renamed from its generic title once a real question is sent
+    # (see on_submit).
+    cid = create_conversation(sess["email"], "New conversation")
+    convs = convs or []
+    if cid is not None:
+        convs = [{"cid": cid, "title": "New conversation",
+                 "meta": _fmt_conv_meta(datetime.now())}] + convs
+    return [], cid, convs, render_stream([], feedback or {}, False)
 
 
 @app.callback(
