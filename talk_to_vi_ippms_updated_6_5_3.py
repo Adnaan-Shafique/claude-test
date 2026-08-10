@@ -938,6 +938,33 @@ def delete_conversation_if_empty(conversation_id: Optional[int], session_key: st
         return False
 
 
+def delete_conversation(conversation_id: Optional[int], session_key: str) -> bool:
+    """Unconditional delete of one conversation AND its messages, for a
+    user-initiated delete from the sidebar (unlike
+    delete_conversation_if_empty, which is the automatic placeholder cleanup
+    and refuses to touch a conversation that has messages). Scoped by
+    session_key so a tampered/guessed id can never delete another user's
+    conversation. Returns True if a conversation row was actually removed."""
+    if conversation_id is None or not _ensure_conversation_tables():
+        return False
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""DELETE FROM {DB_SCHEMA}.vi_chat_messages
+                    WHERE conversation_id = %s AND session_key = %s""",
+                (conversation_id, session_key),
+            )
+            cur.execute(
+                f"""DELETE FROM {DB_SCHEMA}.vi_chat_conversations
+                    WHERE id = %s AND session_key = %s""",
+                (conversation_id, session_key),
+            )
+            return bool(cur.rowcount)
+    except Exception as exc:
+        log.warning("delete_conversation failed: %s", exc)
+        return False
+
+
 def _purge_expired_conversations() -> None:
     """Hard-delete conversations (and their messages) inactive for more than
     CHAT_HISTORY_RETENTION_DAYS. A whole conversation expires together, based
@@ -4761,11 +4788,21 @@ app.index_string = """
         cursor:pointer;font-size:13px;font-weight:600;}
     .s-new:hover{border-color:var(--cyan);}
     .s-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;}
-    .s-item{padding:9px 10px;border-radius:7px;border:1px solid transparent;cursor:pointer;}
-    .s-item:hover{background:var(--panel2);}
-    .s-act{background:var(--panel2);border-color:var(--cyan)44;}
+    /* The row is a flex wrapper: the clickable open-conversation area and the
+       delete button are SIBLINGS, never nested. A button inside the clickable
+       Div would bubble its click up and also fire the open-conversation
+       callback, so deleting would first switch to the very conversation being
+       deleted. */
+    .s-row{display:flex;align-items:center;gap:2px;border-radius:7px;border:1px solid transparent;}
+    .s-row:hover{background:var(--panel2);}
+    .s-item{flex:1;min-width:0;padding:9px 10px;cursor:pointer;}
+    .s-act{background:var(--panel2);border-color:#22d3ee44;}
     .s-ttl{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
     .s-meta{font-size:10px;color:var(--muted);margin-top:2px;}
+    .s-del{background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:13px;line-height:1;
+        padding:7px 9px;margin-right:4px;border-radius:6px;flex-shrink:0;opacity:0;transition:opacity .12s;}
+    .s-row:hover .s-del{opacity:1;}
+    .s-del:hover{color:var(--red);background:rgba(248,113,113,.14);}
     .main{grid-area:main;display:flex;flex-direction:column;overflow:hidden;}
     .scroll{flex:1;overflow-y:auto;padding:24px 20px;}
     .stream{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:20px;}
@@ -4896,6 +4933,9 @@ app.index_string = """
     .fbm-btn-primary{background:var(--cyan);color:#04202b;border:none;padding:8px 16px;border-radius:7px;
         font-size:13px;font-weight:700;cursor:pointer;}
     .fbm-btn-primary:hover{background:#67e8f9;}
+    .fbm-btn-danger{background:var(--red);color:#2b0505;border:none;padding:8px 16px;border-radius:7px;
+        font-size:13px;font-weight:700;cursor:pointer;}
+    .fbm-btn-danger:hover{background:#fca5a5;}
     </style>
 </head>
 <body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer>
@@ -5348,6 +5388,28 @@ def feedback_modal(index: int):
     ])
 
 
+def delete_modal(cid, title: str):
+    """Confirmation for deleting a conversation. Deleting removes the whole
+    transcript from Postgres and cannot be undone, so it is worth one click of
+    confirmation rather than losing history to a mis-click on a button that
+    sits right next to the one that opens the conversation. Same
+    pattern-matched-id reasoning as feedback_modal above."""
+    return html.Div(className="fbm-backdrop", children=[
+        html.Div(className="fbm-card", children=[
+            html.Div("Delete this conversation?", className="fbm-title"),
+            html.P([html.Span("“"), html.B(title or "New conversation"), html.Span("” "),
+                    "and all of its messages will be permanently deleted. "
+                    "This can't be undone."], className="fbm-sub"),
+            html.Div(className="fbm-actions", children=[
+                html.Button("Cancel", id={"type": "delmodal-cancel", "cid": cid},
+                           n_clicks=0, className="fbm-btn-ghost"),
+                html.Button("Delete", id={"type": "delmodal-confirm", "cid": cid},
+                           n_clicks=0, className="fbm-btn-danger"),
+            ]),
+        ]),
+    ])
+
+
 # ── Main app layout ──────────────────────────────────────────────────────────
 
 def _fmt_conv_meta(ts: Any) -> str:
@@ -5362,14 +5424,24 @@ def _fmt_conv_meta(ts: Any) -> str:
 
 
 def conv_items(convs, active_cid):
-    """Just the clickable conversation rows. This is the ONLY part of the
-    sidebar that conversation-switching re-renders — see sidebar() below."""
+    """Just the conversation rows. This is the ONLY part of the sidebar that
+    conversation-switching re-renders — see sidebar() below.
+
+    Each row holds two SIBLINGS: the clickable open-conversation area and the
+    delete button. The delete button is deliberately NOT nested inside the
+    clickable Div — a click inside an html.Div bubbles up and increments that
+    Div's n_clicks too, so a nested delete button would also fire
+    switch_conv and open the conversation it is about to delete."""
     items = []
     for c in convs or []:
-        cls = "s-item s-act" if c["cid"] == active_cid else "s-item"
-        items.append(html.Div(className=cls, id={"type": "conv", "cid": c["cid"]}, n_clicks=0,
-                              children=[html.Div(c["title"], className="s-ttl"),
-                                        html.Div(c["meta"], className="s-meta")]))
+        cls = "s-row s-act" if c["cid"] == active_cid else "s-row"
+        items.append(html.Div(className=cls, children=[
+            html.Div(className="s-item", id={"type": "conv", "cid": c["cid"]}, n_clicks=0,
+                     children=[html.Div(c["title"], className="s-ttl"),
+                               html.Div(c["meta"], className="s-meta")]),
+            html.Button("🗑", id={"type": "conv-del", "cid": c["cid"]}, n_clicks=0,
+                        className="s-del", title="Delete this conversation"),
+        ]))
     return items
 
 
@@ -5442,10 +5514,12 @@ app.layout = html.Div([
     dcc.Store(id="sfeedback", storage_type="memory", data={}),
     dcc.Store(id="spending", storage_type="memory", data=None),
     dcc.Store(id="sfbmodal", storage_type="memory", data=None),   # {"index": <msg index>} or None
+    dcc.Store(id="sdelmodal", storage_type="memory", data=None),  # {"cid":..., "title":...} or None
     dcc.Download(id="csv-dl"),
     html.Div(id="login-view", children=login_page(), style={"display": "block"}),
     html.Div(id="main-view", children=main_page("", [], None, [], {}, False), style={"display": "none"}),
     html.Div(id="fb-modal-host"),
+    html.Div(id="del-modal-host"),
 ])
 
 
@@ -5875,6 +5949,87 @@ def switch_conv(_n, feedback, auth, prev_cid, prev_msgs, convs):
             convs = [c for c in convs if c["cid"] != prev_cid]
     msgs = load_conversation_messages(cid, sess["email"])
     return cid, msgs, convs, render_stream(msgs, feedback or {}, False), conv_items(convs, cid)
+
+
+# ── Delete a conversation (sidebar 🗑 -> confirm -> delete) ───────────────────
+
+@app.callback(
+    Output("sdelmodal", "data"),
+    Input({"type": "conv-del", "cid": ALL}, "n_clicks"),
+    State("sconvs", "data"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def ask_delete_conversation(_n, convs, auth):
+    """Open the confirmation dialog. These buttons live inside conv-list-host,
+    which other callbacks re-render, so they get reinserted regularly — hence
+    the same all-zero guard used by switch_conv."""
+    trig = ctx.triggered_id
+    clicked = [i["value"] for i in ctx.inputs_list[0]]
+    if not isinstance(trig, dict) or not any((n or 0) > 0 for n in clicked):
+        return no_update
+    if not session_get((auth or {}).get("token")):
+        return no_update
+    cid = trig["cid"]
+    title = next((c.get("title") for c in (convs or []) if c["cid"] == cid), "")
+    return {"cid": cid, "title": title}
+
+
+@app.callback(
+    Output("del-modal-host", "children"),
+    Input("sdelmodal", "data"),
+)
+def render_delete_modal(state):
+    if not state:
+        return None
+    return delete_modal(state.get("cid"), state.get("title"))
+
+
+@app.callback(
+    Output("sdelmodal", "data", allow_duplicate=True),
+    Output("sconvs", "data", allow_duplicate=True),
+    Output("scid", "data", allow_duplicate=True),
+    Output("smsgs", "data", allow_duplicate=True),
+    Output("stream-host", "children", allow_duplicate=True),
+    Output("conv-list-host", "children", allow_duplicate=True),
+    Input({"type": "delmodal-confirm", "cid": ALL}, "n_clicks"),
+    Input({"type": "delmodal-cancel", "cid": ALL}, "n_clicks"),
+    State("sconvs", "data"),
+    State("scid", "data"),
+    State("smsgs", "data"),
+    State("sfeedback", "data"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def confirm_delete_conversation(_ok, _cancel, convs, cid, msgs, feedback, auth):
+    trig = ctx.triggered_id
+    clicked = [i["value"] for i in (ctx.inputs_list[0] + ctx.inputs_list[1])]
+    if not isinstance(trig, dict) or not any((n or 0) > 0 for n in clicked):
+        return (no_update,) * 6
+    # Cancel (or no session): just close the dialog, change nothing.
+    sess = session_get((auth or {}).get("token"))
+    if trig.get("type") != "delmodal-confirm" or not sess:
+        return None, no_update, no_update, no_update, no_update, no_update
+
+    del_cid = trig["cid"]
+    if not delete_conversation(del_cid, sess["email"]):
+        # Nothing removed (already gone, or not this user's) — close and resync
+        # the list from the database so the sidebar reflects reality.
+        convs = [{"cid": c["id"], "title": c["title"], "meta": _fmt_conv_meta(c["last_active_at"])}
+                 for c in list_conversations(sess["email"])]
+        return None, convs, no_update, no_update, no_update, conv_items(convs, cid)
+
+    convs = [c for c in (convs or []) if c["cid"] != del_cid]
+    if del_cid != cid:
+        # Deleted a conversation the user wasn't reading — leave the open one
+        # (and its transcript) exactly as it is.
+        return None, convs, no_update, no_update, no_update, conv_items(convs, cid)
+    # Deleted the conversation currently on screen — fall back to the next most
+    # recent one, or an empty pane if that was the last conversation.
+    new_cid = convs[0]["cid"] if convs else None
+    new_msgs = load_conversation_messages(new_cid, sess["email"]) if new_cid else []
+    return (None, convs, new_cid, new_msgs,
+            render_stream(new_msgs, feedback or {}, False), conv_items(convs, new_cid))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
