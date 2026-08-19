@@ -1016,6 +1016,110 @@ def _ensure_retention_sweeper() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4B-3 — GLOSSARY OF DOMAIN TERMS  (SME input; storage + capture only)
+# ══════════════════════════════════════════════════════════════════════════════
+#  A small SME-maintained dictionary of VI-IPPMS terms, abbreviations and
+#  business rules, captured through the chat UI (see the "Add glossary term"
+#  modal in SECTION 15/16).
+#
+#  RETRIEVAL IS DELIBERATELY OUT OF SCOPE for this pass: nothing here is read
+#  back into the agent's prompt yet. This is storage + input only, so the SMEs
+#  can start filling the glossary while the matching/injection logic is
+#  designed separately.
+#
+#  Same independent best-effort gate as the other tables (own flag/lock, own
+#  DDL, never bundled into another table's transaction), so a failure creating
+#  this one can't disable chat logging or history.
+
+_GLOSSARY_DDL = f"""
+CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_glossary_terms (
+    id              SERIAL PRIMARY KEY,
+    term            TEXT NOT NULL,
+    full_form       TEXT,
+    definition      TEXT NOT NULL,
+    also_known_as   TEXT,
+    filled_by       TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+# Unique on lower(term) so the same term can't be stored twice under different
+# casing; a re-submission of an existing term is treated as an edit (upsert)
+# rather than an error. This index is also the ON CONFLICT target below, so it
+# has to exist before the first upsert runs.
+_GLOSSARY_IDX_DDL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS ux_vi_glossary_terms_term
+    ON {DB_SCHEMA}.vi_glossary_terms (lower(term));
+"""
+
+_glossary_ready = False
+_glossary_ready_lock = threading.Lock()
+
+
+def _ensure_glossary_table() -> bool:
+    global _glossary_ready
+    if _glossary_ready:
+        return True
+    with _glossary_ready_lock:
+        if _glossary_ready:
+            return True
+        if not DB_PASSWORD:
+            return False
+        try:
+            with _log_cursor(commit=True) as cur:
+                cur.execute(_GLOSSARY_DDL)
+                cur.execute(_GLOSSARY_IDX_DDL)
+            _glossary_ready = True
+            log.info("[STARTUP] glossary table ready.")
+            return True
+        except Exception as exc:
+            log.warning("Could not ensure vi_glossary_terms (glossary capture disabled): %s", exc)
+            return False
+
+
+def upsert_glossary_term(term: str, full_form: str, definition: str,
+                         also_known_as: str, filled_by: str) -> Tuple[bool, bool, str]:
+    """Insert a glossary entry, or update the existing row when that term is
+    already present (case-insensitively). Returns (ok, was_update, error).
+
+    `term` itself is intentionally NOT overwritten on conflict — the row keeps
+    the casing it was first stored under, so re-submitting "bgp" doesn't
+    rewrite an existing "BGP" entry's display form. Everything else the SME
+    typed does replace what was there.
+
+    Unlike the fire-and-forget logging helpers in this file, the caller needs
+    to know whether this actually succeeded (it drives the modal's inline
+    error vs. its success toast), so the failure is returned rather than only
+    logged."""
+    if not _ensure_glossary_table():
+        return False, False, "The glossary database isn't reachable right now. Please try again later."
+    try:
+        with _log_cursor(commit=True) as cur:
+            cur.execute(
+                f"""INSERT INTO {DB_SCHEMA}.vi_glossary_terms
+                        (term, full_form, definition, also_known_as, filled_by)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (lower(term)) DO UPDATE SET
+                        full_form     = EXCLUDED.full_form,
+                        definition    = EXCLUDED.definition,
+                        also_known_as = EXCLUDED.also_known_as,
+                        filled_by     = EXCLUDED.filled_by,
+                        updated_at    = now()
+                    RETURNING (xmax = 0) AS inserted""",
+                (term, full_form or None, definition, also_known_as or None, filled_by),
+            )
+            row = cur.fetchone()
+            # xmax = 0 on a freshly inserted row, non-zero when the row was
+            # updated by this statement — the standard way to tell an upsert's
+            # two outcomes apart, used here only to word the confirmation.
+            was_update = not bool(row and row.get("inserted"))
+            return True, was_update, ""
+    except Exception as exc:
+        log.warning("upsert_glossary_term failed for %r: %s", term, exc)
+        return False, False, f"Could not save the term: {exc}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 4C — CONSOLIDATED TOOL KB + LOCAL RAG  (§3.4 / §4.2D / §4.3)
 # ══════════════════════════════════════════════════════════════════════════════
 #  One knowledge source, two uses:
@@ -4936,6 +5040,18 @@ app.index_string = """
     .fbm-btn-danger{background:var(--red);color:#2b0505;border:none;padding:8px 16px;border-radius:7px;
         font-size:13px;font-weight:700;cursor:pointer;}
     .fbm-btn-danger:hover{background:#fca5a5;}
+    /* glossary form */
+    .fbm-input{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+        color:var(--text);font-size:13px;font-family:'Inter',sans-serif;padding:10px 12px;margin-bottom:10px;}
+    .fbm-input:focus{outline:none;border-color:var(--cyan);}
+    .fbm-err{margin-top:12px;padding:9px 12px;background:rgba(248,113,113,.1);
+        border:1px solid rgba(248,113,113,.35);color:var(--red);border-radius:7px;font-size:12.5px;}
+    /* success toast — self-hiding via CSS so it needs no polling callback */
+    .toast{position:fixed;bottom:24px;right:24px;z-index:1100;background:var(--panel);
+        border:1px solid var(--green);color:var(--text);padding:11px 16px;border-radius:8px;
+        font-size:13px;box-shadow:0 10px 30px rgba(0,0,0,.5);animation:toastfade 4.5s ease forwards;}
+    @keyframes toastfade{0%{opacity:0;transform:translateY(8px)}6%{opacity:1;transform:translateY(0)}
+        80%{opacity:1;transform:translateY(0)}100%{opacity:0;transform:translateY(8px);visibility:hidden}}
     </style>
 </head>
 <body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer>
@@ -5410,6 +5526,38 @@ def delete_modal(cid, title: str):
     ])
 
 
+def glossary_modal():
+    """The "Add glossary term" form. Fixed ids (not the pattern-matched ones
+    the other two modals use) because the spec names them, which is fine here
+    since submit/cancel both carry an explicit n_clicks guard against the
+    insert-fire — see submit_glossary_term.
+
+    'Filled by' is deliberately not a field: it's taken from the signed-in
+    session so nobody retypes their own identity (and can't attribute an entry
+    to someone else)."""
+    return html.Div(className="fbm-backdrop", children=[
+        html.Div(className="fbm-card", children=[
+            html.Div("Add a glossary term", className="fbm-title"),
+            html.P("Teach the assistant a VI-IPPMS term, abbreviation or business rule. "
+                   "Submitting a term that already exists updates it.", className="fbm-sub"),
+            dcc.Input(id="glossary-term", type="text", className="fbm-input",
+                      placeholder="Term / Abbreviation *", debounce=False),
+            dcc.Input(id="glossary-fullform", type="text", className="fbm-input",
+                      placeholder="Full Form (leave empty if N/A)"),
+            dcc.Textarea(id="glossary-definition", className="fbm-textarea",
+                         placeholder="Definition / Rule *"),
+            dcc.Input(id="glossary-aka", type="text", className="fbm-input",
+                      placeholder="Also Known As (comma-separated)",
+                      style={"marginTop": "10px"}),
+            html.Div(id="glossary-error"),
+            html.Div(className="fbm-actions", children=[
+                html.Button("Cancel", id="glossary-cancel", n_clicks=0, className="fbm-btn-ghost"),
+                html.Button("Submit", id="glossary-submit", n_clicks=0, className="fbm-btn-primary"),
+            ]),
+        ]),
+    ])
+
+
 # ── Main app layout ──────────────────────────────────────────────────────────
 
 def _fmt_conv_meta(ts: Any) -> str:
@@ -5463,6 +5611,10 @@ def sidebar(convs, active_cid):
         html.Div("Conversations", className="s-hdr"),
         html.Button("＋  New conversation", id="new-conv", n_clicks=0, className="s-new"),
         html.Div(conv_items(convs, active_cid), id="conv-list-host", className="s-list"),
+        # Sits OUTSIDE conv-list-host for the same reason the New conversation
+        # button does — anything inside that subtree gets reinserted on every
+        # conversation switch and fires its callback spuriously.
+        html.Button("📖  Add glossary term", id="glossary-add-btn", n_clicks=0, className="s-new"),
     ])
 
 
@@ -5515,11 +5667,14 @@ app.layout = html.Div([
     dcc.Store(id="spending", storage_type="memory", data=None),
     dcc.Store(id="sfbmodal", storage_type="memory", data=None),   # {"index": <msg index>} or None
     dcc.Store(id="sdelmodal", storage_type="memory", data=None),  # {"cid":..., "title":...} or None
+    dcc.Store(id="sglossary", storage_type="memory", data=None),  # True while the form is open
     dcc.Download(id="csv-dl"),
     html.Div(id="login-view", children=login_page(), style={"display": "block"}),
     html.Div(id="main-view", children=main_page("", [], None, [], {}, False), style={"display": "none"}),
     html.Div(id="fb-modal-host"),
     html.Div(id="del-modal-host"),
+    html.Div(id="glossary-modal-host"),
+    html.Div(id="glossary-toast"),
 ])
 
 
@@ -6032,6 +6187,74 @@ def confirm_delete_conversation(_ok, _cancel, convs, cid, msgs, feedback, auth):
             render_stream(new_msgs, feedback or {}, False), conv_items(convs, new_cid))
 
 
+# ── Glossary capture (sidebar 📖 -> form -> upsert) ───────────────────────────
+
+@app.callback(
+    Output("sglossary", "data"),
+    Input("glossary-add-btn", "n_clicks"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def open_glossary_modal(_n, auth):
+    # n_clicks == 0 means the button was just (re)inserted by a page rebuild,
+    # not pressed — same guard as new_conv/do_logout.
+    if not _n or not session_get((auth or {}).get("token")):
+        return no_update
+    return True
+
+
+@app.callback(
+    Output("glossary-modal-host", "children"),
+    Input("sglossary", "data"),
+)
+def render_glossary_modal(is_open):
+    return glossary_modal() if is_open else None
+
+
+@app.callback(
+    Output("sglossary", "data", allow_duplicate=True),
+    Output("glossary-error", "children"),
+    Output("glossary-toast", "children"),
+    Input("glossary-submit", "n_clicks"),
+    Input("glossary-cancel", "n_clicks"),
+    State("glossary-term", "value"),
+    State("glossary-fullform", "value"),
+    State("glossary-definition", "value"),
+    State("glossary-aka", "value"),
+    State("sauth", "data"),
+    prevent_initial_call=True,
+)
+def submit_glossary_term(_submit, _cancel, term, full_form, definition, aka, auth):
+    """Validate, upsert, and close. Returns no_update for glossary-error
+    whenever the modal is being closed, since that element is about to be
+    destroyed along with the rest of the form."""
+    # Both buttons are created the moment the modal is inserted, which fires
+    # this callback with both at 0 — ignore that, same guard as everywhere else.
+    if not (_submit or _cancel):
+        return no_update, no_update, no_update
+    if ctx.triggered_id == "glossary-cancel":
+        return None, no_update, no_update
+
+    sess = session_get((auth or {}).get("token"))
+    if not sess:
+        return None, no_update, no_update
+
+    term = (term or "").strip()
+    definition = (definition or "").strip()
+    full_form = (full_form or "").strip()
+    aka = (aka or "").strip()
+    if not term or not definition:
+        missing = " and ".join(
+            [n for n, v in (("a term", term), ("a definition", definition)) if not v])
+        return no_update, html.Div(f"Please enter {missing}.", className="fbm-err"), no_update
+
+    ok, was_update, err = upsert_glossary_term(term, full_form, definition, aka, sess["email"])
+    if not ok:
+        return no_update, html.Div(err, className="fbm-err"), no_update
+    verb = "updated" if was_update else "added"
+    return None, no_update, html.Div(f"📖  Glossary term “{term}” {verb}.", className="toast")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 17 — ENTRYPOINT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6052,12 +6275,14 @@ def _warm_startup():
     _ensure_user_feedback_table()   # best-effort create user_feedback, independently
     _ensure_conversation_tables()   # best-effort create chat history tables, independently
     _ensure_retention_sweeper()     # start the 7-day retention purge thread
+    _ensure_glossary_table()        # best-effort create vi_glossary_terms, independently
     log.info("[STARTUP] tool KB %s, question guide %d rows, logging %s, "
-             "user_feedback %s, chat_history %s.",
+             "user_feedback %s, chat_history %s, glossary %s.",
              "loaded" if TOOL_KB_TEXT else "MISSING", len(_GUIDE_ROWS),
              "ready" if _logging_ready else "disabled",
              "ready" if _user_feedback_ready else "disabled",
-             "ready" if _conversation_tables_ready else "disabled")
+             "ready" if _conversation_tables_ready else "disabled",
+             "ready" if _glossary_ready else "disabled")
 
 
 if __name__ == "__main__":
