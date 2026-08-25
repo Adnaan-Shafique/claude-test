@@ -241,6 +241,22 @@ CHAT_HISTORY_RETENTION_DAYS  = int(os.environ.get("VI_CHAT_HISTORY_RETENTION_DAY
 CHAT_HISTORY_SWEEP_INTERVAL  = int(os.environ.get("VI_CHAT_HISTORY_SWEEP_INTERVAL", str(6 * 3600)))
 CHAT_HISTORY_MAX_CONVS       = int(os.environ.get("VI_CHAT_HISTORY_MAX_CONVS", "100"))
 
+# ── Glossary editors ─────────────────────────────────────────────────────────
+#  ►► TO GRANT OR REVOKE GLOSSARY ACCESS, EDIT THIS LIST ◄◄
+#
+#  Only these people can add or edit glossary terms. Everyone else uses the
+#  assistant exactly as before — they simply don't see the "Add glossary term"
+#  button, and the submit callback refuses their writes even if the button is
+#  bypassed (a hidden button is not access control on its own, so this is
+#  checked server-side on both the open and the submit path).
+#
+#  Entries are matched case-insensitively against the signed-in user's email,
+#  so the casing written here doesn't matter.
+GLOSSARY_EDITORS = {
+    "mohammed.shafique@vodafoneidea.com",
+    "devang.sheth@vodafoneidea.com",
+}
+
 # Decode presets per graph role (mirrors gpu_llm_context.py).
 # SYNTHESIS is now temperature 0.0 (was 0.3): the query-spec engine makes the
 # retrieved DATA deterministic; setting synthesis to 0.0 makes the phrasing as
@@ -1030,6 +1046,17 @@ def _ensure_retention_sweeper() -> None:
 #  Same independent best-effort gate as the other tables (own flag/lock, own
 #  DDL, never bundled into another table's transaction), so a failure creating
 #  this one can't disable chat logging or history.
+
+def can_edit_glossary(email: Optional[str]) -> bool:
+    """Is this user allowed to add/edit glossary terms? (see GLOSSARY_EDITORS)
+
+    The list is normalized here on every call rather than once at import, so
+    editing GLOSSARY_EDITORS is genuinely the only thing anyone has to change
+    — there's no second, pre-computed copy to keep in sync. The list is a
+    handful of entries, so the cost is irrelevant."""
+    e = (email or "").strip().lower()
+    return bool(e) and e in {x.strip().lower() for x in GLOSSARY_EDITORS}
+
 
 _GLOSSARY_DDL = f"""
 CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.vi_glossary_terms (
@@ -5593,7 +5620,7 @@ def conv_items(convs, active_cid):
     return items
 
 
-def sidebar(convs, active_cid):
+def sidebar(convs, active_cid, email: str = ""):
     """BUGFIX: the "New conversation" button must stay OUTSIDE the subtree
     that gets re-rendered when the conversation list/highlight changes.
 
@@ -5607,15 +5634,24 @@ def sidebar(convs, active_cid):
 
     Only conv-list-host below is re-rendered now, so the button — and its
     callback — are untouched by conversation switching."""
-    return html.Div(className="sidebar", children=[
+    children = [
         html.Div("Conversations", className="s-hdr"),
         html.Button("＋  New conversation", id="new-conv", n_clicks=0, className="s-new"),
         html.Div(conv_items(convs, active_cid), id="conv-list-host", className="s-list"),
-        # Sits OUTSIDE conv-list-host for the same reason the New conversation
-        # button does — anything inside that subtree gets reinserted on every
-        # conversation switch and fires its callback spuriously.
-        html.Button("📖  Add glossary term", id="glossary-add-btn", n_clicks=0, className="s-new"),
-    ])
+    ]
+    # Glossary editing is restricted (GLOSSARY_EDITORS), so the button is only
+    # rendered for those users. This is presentation only — open_glossary_modal
+    # and submit_glossary_term both re-check server-side, since a hidden button
+    # stops nobody from issuing the callback request by hand.
+    #
+    # Sits OUTSIDE conv-list-host for the same reason the New conversation
+    # button does — anything inside that subtree gets reinserted on every
+    # conversation switch and fires its callback spuriously.
+    if can_edit_glossary(email):
+        children.append(
+            html.Button("📖  Add glossary term", id="glossary-add-btn", n_clicks=0,
+                        className="s-new"))
+    return html.Div(className="sidebar", children=children)
 
 
 def main_page(email: str, convs, active_cid, messages, feedback, pending):
@@ -5632,7 +5668,7 @@ def main_page(email: str, convs, active_cid, messages, feedback, pending):
                 html.Button("Sign out", id="logout-btn", n_clicks=0, className="logout"),
             ]),
         ]),
-        sidebar(convs, active_cid),
+        sidebar(convs, active_cid, email),
         html.Div(className="main", children=[
             html.Div(className="scroll", children=[
                 html.Div(id="stream-host", children=render_stream(messages, feedback, pending))
@@ -6198,7 +6234,12 @@ def confirm_delete_conversation(_ok, _cancel, convs, cid, msgs, feedback, auth):
 def open_glossary_modal(_n, auth):
     # n_clicks == 0 means the button was just (re)inserted by a page rebuild,
     # not pressed — same guard as new_conv/do_logout.
-    if not _n or not session_get((auth or {}).get("token")):
+    if not _n:
+        return no_update
+    sess = session_get((auth or {}).get("token"))
+    # Re-check authorization here, not just when rendering the sidebar: the
+    # button being hidden doesn't prevent anyone from issuing this callback.
+    if not sess or not can_edit_glossary(sess.get("email")):
         return no_update
     return True
 
@@ -6238,6 +6279,15 @@ def submit_glossary_term(_submit, _cancel, term, full_form, definition, aka, aut
     sess = session_get((auth or {}).get("token"))
     if not sess:
         return None, no_update, no_update
+    # The real authorization gate for writes. Hiding the sidebar button is
+    # presentation only; this is what actually stops a non-editor's write,
+    # including one issued by hand or left over from a stale open form after
+    # the GLOSSARY_EDITORS list changed.
+    if not can_edit_glossary(sess.get("email")):
+        log.warning("[GLOSSARY] refused edit by unauthorized user %s", sess.get("email"))
+        return no_update, html.Div(
+            "You don't have permission to add glossary terms. Contact the "
+            "VI-IPPMS team if you need access.", className="fbm-err"), no_update
 
     term = (term or "").strip()
     definition = (definition or "").strip()
