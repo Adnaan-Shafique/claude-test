@@ -1318,7 +1318,7 @@ def _kpi_component_hint(kpi_text: str) -> Optional[str]:
     component duplicating a subset of what "traffic" already tracks) — without
     this, whichever component sorted first alphabetically silently won,
     regardless of which one a human would actually mean by that KPI name."""
-    kt = (kpi_text or "").lower()
+    kt = _norm_text(kpi_text)
     for comp, syns in KPI_SYNONYMS.items():
         if any(s in kt for s in syns):
             return comp
@@ -1857,6 +1857,25 @@ def _as_int(v: Any) -> Optional[int]:
     return int(f) if f is not None else None
 
 
+def _norm_text(v: Any) -> str:
+    """Comparison form for matching what a user TYPED against what the API
+    RETURNED: lowercased, outer whitespace stripped, inner runs of whitespace
+    collapsed to one space.
+
+    Every place a question's wording is matched against live data goes through
+    this, so "HC In Octets", "hc in octets" and "hc  in   octets" all compare
+    equal. Names are only ever normalized for the COMPARISON — whatever is
+    shown back to the user, or sent on to the API, stays in the API's own
+    spelling."""
+    return re.sub(r"\s+", " ", _as_text(v).strip().lower())
+
+
+def _norm_iface(v: Any) -> str:
+    """_norm_text plus dropping a leading "Interface " label, so
+    "Interface Eth-Trunk1", "eth-trunk1" and "ETH-TRUNK1" all compare equal."""
+    return re.sub(r"^interface\s+", "", _norm_text(v))
+
+
 def _norm_items(payload: Any) -> List[str]:
     """Normalize an ig_list_interfaces component payload to a list of interface
     prefix STRINGS, preserving the trailing ' ::' verbatim (ig_list_kpis needs
@@ -2109,8 +2128,8 @@ def router_node(state: VIAgentState) -> VIAgentState:
     # quoted KPI phrase starting with "Utilization" gets wrongly treated as
     # "claimed" by the component slot and dropped), on top of scoping the
     # interface search down to a component that doesn't exist.
-    comp_l = ent["component"].strip().lower()
-    if comp_l and (comp_l == ent["kpi"].strip().lower() or comp_l in _KPI_SYNONYM_ONLY_WORDS):
+    comp_l = _norm_text(ent["component"])
+    if comp_l and (comp_l == _norm_text(ent["kpi"]) or comp_l in _KPI_SYNONYM_ONLY_WORDS):
         ent["component"] = ""
     log.info("[ROUTER] route=%s target=%s metric=%s device=%r circle=%r",
              route, ent["target"], ent["metric"], ent["device"], ent["circle"])
@@ -3098,35 +3117,48 @@ def _multiple_devices_message(devices: List[Dict[str, Any]]) -> str:
 
 def _resolve_component_filter(spec: Dict[str, Any], devices: List[Dict[str, Any]],
                               tl: "_ToolLog"):
-    """If the question named a component the fast-path regex didn't recognize
-    (spec['component_filter_raw']), resolve it against the target device's REAL
-    component list — exact match, then unique substring, then edit-distance —
-    instead of guessing blind or silently dropping the filter.
+    """Resolve whichever component the question named — from the router's
+    `component` entity, the fast keyword list, or the raw phrase — against the
+    target device's REAL component list (exact, then unique substring, then
+    edit-distance), and hand back the API's OWN spelling of it.
+
+    BUGFIX (case sensitivity): this used to return spec['component_filter']
+    untouched whenever it was set, and only validated the `_raw` fallback. But
+    build_spec lowercases the router's component entity, so a device whose real
+    component is "Traffic" was then queried for "traffic" and compared with
+    `cf == c` further down — both of which fail on any casing the API doesn't
+    happen to match, silently yielding "0 interfaces"/"0 KPIs" for a perfectly
+    valid question. Resolving EVERY filter here means the rest of the executor
+    always works with the API's own spelling, and a component that matches
+    nothing at all now produces a real clarification (listing what the device
+    does have) instead of an empty result.
 
     Returns (component_filter_or_None, unresolved_or_None). unresolved, when
-    present, is (raw_phrase, candidate_component_names) for a clarification
+    present, is (phrase, candidate_component_names) for a clarification
     message; candidate_component_names is either the ambiguous matches or, if
     nothing matched at all, the device's full live component list."""
     cf = spec.get("component_filter")
-    raw = spec.get("component_filter_raw")
-    if cf or not raw or not devices:
+    # A filter from the router/fast-list takes precedence over the raw phrase,
+    # but BOTH now get validated against live data rather than trusted as-is.
+    wanted = (cf[0] if cf else spec.get("component_filter_raw"))
+    if not wanted or not devices:
         return cf, None
     live = _components_for(devices[0], tl)
     if not live:
-        return None, None                  # nothing to resolve against; let caller proceed unfiltered
-    raw_l = raw.strip().lower()
-    exact = [c for c in live if c.lower() == raw_l]
+        return cf, None                    # nothing to resolve against; let caller proceed
+    w = _norm_text(wanted)
+    exact = [c for c in live if _norm_text(c) == w]
     if exact:
         return [exact[0]], None
-    contains = [c for c in live if raw_l in c.lower() or c.lower() in raw_l]
+    contains = [c for c in live if w in _norm_text(c) or _norm_text(c) in w]
     if len(contains) == 1:
         return [contains[0]], None
     if len(contains) > 1:
-        return None, (raw, contains)
-    scored = sorted(((_similar(raw_l, c.lower()), c) for c in live), reverse=True)
+        return None, (wanted, contains)
+    scored = sorted(((_similar(w, _norm_text(c)), c) for c in live), reverse=True)
     if scored and scored[0][0] >= 0.6:
         return [scored[0][1]], None
-    return None, (raw, live)
+    return None, (wanted, live)
 
 
 def _component_clarification(raw: str, options: List[str], host_name: str) -> str:
@@ -3202,12 +3234,12 @@ def _validate_single_interface_kpi(spec: Dict[str, Any], state: VIAgentState,
     all_items = [(comp, it) for comp, payload in by_comp.items()
                 for it in _norm_items(payload)]
     wanted_iface = _as_text(iface_filter.get("value"))
-    wanted_l = re.sub(r"^interface\s+", "", wanted_iface.strip().lower())
+    wanted_l = _norm_iface(wanted_iface)
     exact = [(c, it) for c, it in all_items
-            if re.sub(r"^interface\s+", "", _iface_display(it).lower()) == wanted_l]
+            if _norm_iface(_iface_display(it)) == wanted_l]
     matches = exact
     if not matches:
-        contains = [(c, it) for c, it in all_items if wanted_l in _iface_display(it).lower()]
+        contains = [(c, it) for c, it in all_items if wanted_l in _norm_iface(_iface_display(it))]
         if len(contains) == 1:
             matches = contains
         elif len(contains) > 1:
@@ -3251,7 +3283,7 @@ def _validate_single_interface_kpi(spec: Dict[str, Any], state: VIAgentState,
     wanted_kpis: Optional[List[str]] = None
     if kpi_filter:
         raw_values = kpi_filter.get("values") or ([kpi_filter.get("value")] if kpi_filter.get("value") else [])
-        wanted_kpis = [_as_text(v).strip().lower() for v in raw_values if _as_text(v).strip()] or None
+        wanted_kpis = [_norm_text(v) for v in raw_values if _as_text(v).strip()] or None
 
     # Try the conventionally-correct component FIRST when several tie on
     # exposing this interface (e.g. "HC In Octets" -> "traffic", per
@@ -3268,7 +3300,12 @@ def _validate_single_interface_kpi(spec: Dict[str, Any], state: VIAgentState,
         hint = _kpi_component_hint(w)
         if hint:
             break
-    ordered_matches = (sorted(matches, key=lambda ci: 0 if ci[0] == hint else 1)
+    # BUGFIX (case sensitivity): _kpi_component_hint returns a lowercase
+    # KPI_SYNONYMS key ("traffic"), while ci[0] is the API's own casing
+    # ("Traffic"), so this tie-break silently never fired and the KPI was
+    # read from whichever component sorted first instead — exactly what the
+    # hint exists to prevent.
+    ordered_matches = (sorted(matches, key=lambda ci: 0 if _norm_text(ci[0]) == _norm_text(hint) else 1)
                        if hint else matches)
 
     comp, item = matches[0]
@@ -3290,7 +3327,7 @@ def _validate_single_interface_kpi(spec: Dict[str, Any], state: VIAgentState,
         # KPI has been satisfied rather than settling for a partial match
         # when a fuller one might still be a later candidate.
         kpi_matches = [e for e in grp_entries
-                      if any(w in _as_text(e.get("suffix")).lower() for w in wanted_kpis)]
+                      if any(w in _norm_text(e.get("suffix")) for w in wanted_kpis)]
         if kpi_matches and len(kpi_matches) > len(entries):
             comp, item, entries = c, it, kpi_matches
             found = True
@@ -3341,18 +3378,19 @@ def _find_interface_across_components(host: Dict[str, Any], iface_value: Any,
     by_comp = _interfaces_by_component_for(host, comps, tl)
     all_items = [(comp, it) for comp, payload in by_comp.items()
                  for it in _norm_items(payload)]
-    wanted_l = re.sub(r"^interface\s+", "", _as_text(iface_value).strip().lower())
+    wanted_l = _norm_iface(iface_value)
     if not wanted_l:
         return None
     exact = [(c, it) for c, it in all_items
-             if re.sub(r"^interface\s+", "", _iface_display(it).lower()) == wanted_l]
+             if _norm_iface(_iface_display(it)) == wanted_l]
     if exact:
         hint = _kpi_component_hint(kpi_hint) if kpi_hint else None
         if hint:
-            exact = sorted(exact, key=lambda ci: 0 if ci[0] == hint else 1)
+            # Same case-sensitivity fix as in _validate_single_interface_kpi.
+            exact = sorted(exact, key=lambda ci: 0 if _norm_text(ci[0]) == _norm_text(hint) else 1)
         return exact[0]
     contains = [(c, it) for c, it in all_items
-                if wanted_l in _iface_display(it).lower()]
+                if wanted_l in _norm_iface(_iface_display(it))]
     if len(contains) == 1:
         return contains[0]
     return None
@@ -3466,8 +3504,12 @@ def _execute_query_spec_once(spec: Dict[str, Any], state: VIAgentState) -> Dict[
             comp_filter = spec.get("component_filter")
             if comp_filter:
                 def keep(h):
-                    comps = _components_for(h, tl)
-                    return all(any(cf == c or cf in c for c in comps) for cf in comp_filter)
+                    # BUGFIX (case sensitivity): compared a build_spec-lowercased
+                    # filter straight against the API's own casing, so
+                    # "devices with a Traffic component" matched nothing.
+                    comps = [_norm_text(c) for c in _components_for(h, tl)]
+                    return all(any(_norm_text(cf) == c or _norm_text(cf) in c for c in comps)
+                               for cf in comp_filter)
                 mask = _parallel_map(keep, devices)
                 devices = [h for h, k in zip(devices, mask) if k is True]
             names = [_host_name(h) for h in devices]
@@ -3531,8 +3573,8 @@ def _execute_query_spec_once(spec: Dict[str, Any], state: VIAgentState) -> Dict[
                 disp = {_iface_display(i) for i in items}
                 disp = {d for d in disp if d}
                 if iface_filter and iface_filter.get("mode") == "contains":
-                    v = _as_text(iface_filter.get("value")).lower()
-                    disp = {d for d in disp if v in d.lower()}
+                    v = _norm_iface(iface_filter.get("value"))
+                    disp = {d for d in disp if v in _norm_iface(d)}
                 return (_host_name(h), sorted(disp))
 
             per = _parallel_map(ifaces_of, devices)
@@ -3711,7 +3753,7 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
     wanted_kpis_all: List[str] = []
     if kpi_filter:
         raw_values = kpi_filter.get("values") or ([kpi_filter.get("value")] if kpi_filter.get("value") else [])
-        wanted_kpis_all = [_as_text(v).strip().lower() for v in raw_values if _as_text(v).strip()]
+        wanted_kpis_all = [_norm_text(v) for v in raw_values if _as_text(v).strip()]
 
     # ── Interface-ranking "currently" shape (§ user request: "top/bottom N
     # interfaces for KPI X on device Y currently"): this ranking is inherently
@@ -3875,12 +3917,12 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
                 comp_to_prefixes[found[0]] = [found[1]]
         else:
             by_comp = _interfaces_by_component_for(h, comps, tl)
-            v = _as_text(iface_filter.get("value")).lower() if (
+            v = _norm_iface(iface_filter.get("value")) if (
                 iface_filter and iface_filter.get("mode") == "contains") else None
             for comp_name, payload in by_comp.items():
                 items = _norm_items(payload)
                 if v:
-                    items = [i for i in items if v in _as_text(i).lower()]
+                    items = [i for i in items if v in _norm_iface(i)]
                 if items:
                     comp_to_prefixes[comp_name] = items
         picks = []
@@ -3895,7 +3937,7 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
                     if not isinstance(e, dict) or e.get("itemid") is None:
                         continue
                     if wanted_kpis_all and not any(
-                            w in _as_text(e.get("suffix")).lower() for w in wanted_kpis_all):
+                            w in _norm_text(e.get("suffix")) for w in wanted_kpis_all):
                         continue
                     picks.append({"itemid": e["itemid"],
                                   "label": f"{_as_text(e.get('prefix'))} : {_as_text(e.get('suffix'))}",
@@ -4080,14 +4122,22 @@ def _execute_values(spec: Dict[str, Any], state: VIAgentState,
 
 
 def _guess_component(ent: Dict[str, Any], g: Dict[str, Any]) -> str:
-    kpi = _as_text(ent.get("kpi")).lower()
+    kpi = _norm_text(ent.get("kpi"))
     for comp, syns in KPI_SYNONYMS.items():
         if any(s in kpi for s in syns):
+            # Compared against the API's own casing, so match normalized and
+            # hand back the API's spelling rather than the synonym-table key.
             avail = [c.get("component") for c in g.get("components", [])]
-            if not avail or comp in avail:
+            hit = [c for c in avail if _norm_text(c) == comp]
+            if not avail:
                 return comp
-    comps = [c.get("component") for c in g.get("components", [])]
-    return "traffic" if ("traffic" in comps or not comps) else (comps[0] if comps else "traffic")
+            if hit:
+                return hit[0]
+    comps = [c.get("component") for c in g.get("components", []) if c.get("component")]
+    traffic = [c for c in comps if _norm_text(c) == "traffic"]
+    if traffic:
+        return traffic[0]
+    return comps[0] if comps else "traffic"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
