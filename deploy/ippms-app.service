@@ -1,0 +1,41 @@
+[Unit]
+Description=Talk to VI-IPPMS (conversational analytics chat app)
+After=network-online.target ippms-mcp.service
+Wants=network-online.target ippms-mcp.service
+# Wants= (not Requires=): the chat app starts and serves its UI even if the
+# MCP server is down — it retries on every call and logs a warning — so a
+# temporarily missing MCP server shouldn't take the whole UI offline. Switch
+# to Requires= if you'd rather the UI refuse to run without it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ippms
+Group=ippms
+WorkingDirectory=/srv/ippms-assistant
+
+EnvironmentFile=/etc/ippms-assistant/ippms.env
+Environment=PYTHONUNBUFFERED=1
+
+# Run the script directly rather than under gunicorn. _warm_startup() — which
+# starts the 7-day chat-history retention sweeper — only runs under
+# `if __name__ == "__main__"`, so under a WSGI server that sweeper never
+# starts and old conversations are never purged. See deploy/README.md if you
+# do want gunicorn.
+ExecStart=/srv/ippms-assistant/venv/bin/python /srv/ippms-assistant/talk_to_vi_ippms_updated_6_5_3.py
+
+Restart=always
+RestartSec=5s
+TimeoutStopSec=20s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ippms-app
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
