@@ -68,8 +68,9 @@ def main() -> int:
     for path in paths:
         image_bgr = load_image_bgr(path)
         h, w = image_bgr.shape[:2]
-        result = detector.detect(image_bgr, path.stem)
-        print(f"{path.name}  ({w}x{h})")
+        result = detector.detect(image_bgr, path.stem, image_path=path)
+        rel = path.parent.name if path.parent != args.target else ""
+        print(f"{path.name}  ({w}x{h})" + (f"  [{rel}/]" if rel else ""))
         if result.detections:
             n_with += 1
             render(image_bgr, result, args.out / f"{path.stem}_detect.jpg")

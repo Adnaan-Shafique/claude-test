@@ -166,8 +166,14 @@ class PipelineConfig:
         if images_dir is not None:
             images_dir = Path(images_dir)
             if images_dir.is_dir() and any(
-                q.name not in ("classes.txt", "obj.names") for q in images_dir.glob("*.txt")
+                q.name not in ("classes.txt", "obj.names")
+                for q in images_dir.rglob("*.txt")
             ):
+                # rglob, not glob: photos are organised into per-class
+                # subfolders, so the .txt files sit a level down. The detector
+                # prefers the sidecar beside each image anyway; this is the
+                # fallback folder, and reporting "no labels" for a tree that
+                # plainly has them is worse than pointing at the root.
                 return images_dir
         return self.annotation_dir
 

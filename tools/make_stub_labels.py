@@ -40,50 +40,67 @@ def labels_in(directory: Path) -> list[Path]:
 
 
 def do_check(images_dir: Path, labels_dir: Path) -> int:
+    """Coverage, matching the way the detector actually looks things up: the
+    sidecar beside each photo first, then the central labels folder."""
     photos = images_in(images_dir)
-    labels = labels_in(labels_dir)
-    photo_stems = {p.stem: p for p in photos}
-    label_stems = {p.stem: p for p in labels}
-
     print(f"photos: {len(photos)} under {images_dir}")
-    print(f"labels: {len(labels)} under {labels_dir}\n")
 
-    matched = sorted(photo_stems.keys() & label_stems.keys())
-    no_label = sorted(photo_stems.keys() - label_stems.keys())
-    orphaned = sorted(label_stems.keys() - photo_stems.keys())
+    matched, missing = [], []
+    folders: dict[Path, int] = {}
+    for photo in photos:
+        sidecar = photo.with_suffix(".txt")
+        central = labels_dir / f"{photo.stem}.txt"
+        found = sidecar if sidecar.exists() else (central if central.exists() else None)
+        if found is None:
+            missing.append(photo)
+            continue
+        matched.append((photo, found))
+        folders[found.parent] = folders.get(found.parent, 0) + 1
 
-    for stem in matched:
-        lines = [ln for ln in label_stems[stem].read_text(errors="replace").splitlines()
+    for photo, label in matched:
+        lines = [ln for ln in label.read_text(errors="replace").splitlines()
                  if ln.strip() and not ln.strip().startswith("#")]
-        print(f"  OK      {stem}  ({len(lines)} box(es))")
-    for stem in no_label:
-        print(f"  NO TXT  {stem}  -> will report 'no annotation file found'")
-    for stem in orphaned:
-        print(f"  ORPHAN  {stem}.txt has no matching photo")
+        where = "beside" if label.parent == photo.parent else str(label.parent)
+        print(f"  OK      {photo.stem}  ({len(lines)} box(es), {where})")
+    for photo in missing:
+        print(f"  NO TXT  {photo.stem}  -> will report 'no annotation file found'")
+
+    # Orphans only make sense per folder that actually holds labels.
+    photo_stems = {p.stem for p in photos}
+    orphans = []
+    for folder in folders:
+        for label in labels_in(folder):
+            if label.stem not in photo_stems:
+                orphans.append(label)
+    for label in sorted(orphans):
+        print(f"  ORPHAN  {label} has no matching photo")
 
     from pipeline.stage2_detect import load_class_names
-    names = load_class_names(labels_dir)
     print()
-    if names:
-        print(f"  class names: {names}")
-    else:
-        print("  class names: NONE - detections will render as class_<id>, in the UI "
-              "and in the prompt sent to the VLM")
+    for folder in sorted(folders):
+        names = load_class_names(folder)
+        if names:
+            print(f"  {folder}: classes {names}")
+        else:
+            print(f"  {folder}: no classes.txt - class ids resolve from the "
+                  f"selected question's defaults (hazard_warning -> hazard_sign, "
+                  f"gps_antenna -> gps_antenna), else class_<id>")
 
-    print(f"\n{len(matched)} matched, {len(no_label)} photo(s) without a label, "
-          f"{len(orphaned)} orphaned label(s)")
-    if no_label:
+    print(f"\n{len(matched)} matched, {len(missing)} photo(s) without a label, "
+          f"{len(orphans)} orphaned label(s)")
+    if missing:
         print("\nEvery demo photo needs a label file, or its detection panel will be "
               "empty with a note. Use --emit to scaffold the missing ones, then "
               "replace the placeholder boxes with real ones.")
-    return 1 if no_label or orphaned else 0
+    return 1 if missing or orphans else 0
 
 
 def do_emit(images_dir: Path, labels_dir: Path, force: bool) -> int:
     labels_dir.mkdir(parents=True, exist_ok=True)
     written = skipped = 0
     for photo in images_in(images_dir):
-        dest = labels_dir / f"{photo.stem}.txt"
+        # Beside the photo, matching the sidecar layout the exports use.
+        dest = photo.with_suffix(".txt")
         if dest.exists() and not force:
             skipped += 1
             continue

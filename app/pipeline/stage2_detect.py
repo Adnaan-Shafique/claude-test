@@ -158,10 +158,22 @@ def parse_annotation_line(line: str, width: int, height: int) -> Optional[dict]:
 # ─────────────────────────────── Backends ────────────────────────────────────
 
 class AnnotationFileDetector:
-    """Reads human annotations from <annotation_dir>/<stem>.txt.
+    """Reads human annotations from a <stem>.txt sidecar.
+
+    Lookup order per image:
+      1. <the image's own folder>/<stem>.txt  - the YOLO/CVAT sidecar layout,
+         which is how the exports actually arrive and how the demo photos are
+         organised. This works at any folder depth and keeps each export's
+         labels with its own photos.
+      2. <cfg.annotation_dir>/<stem>.txt      - a separate central label folder.
+
+    Class names are resolved per FOLDER, not once per run: two single-class
+    exports both number their only class 0, so the names have to come from
+    whichever folder that particular label file was found in (or, failing that,
+    from the selected question).
 
     Returns the identical shape the real detector does, so nothing downstream
-    can tell them apart - except .is_stub and .model_name, which exist precisely
+    can tell them apart - except is_stub and model_name, which exist precisely
     so the UI can say so out loud.
     """
 
@@ -175,36 +187,66 @@ class AnnotationFileDetector:
             annotation_dir if annotation_dir is not None
             else cfg.resolve_annotation_dir(question_id=getattr(question, "id", None)))
         self.conf_range = tuple(cfg.stub_conf_range)
+        self._names_cache: dict = {}
+        # Reported by the UI and the smoke tool. With sidecars this is only the
+        # fallback folder; the per-image lookup may resolve elsewhere.
+        names, source = self._names_for(self.annotation_dir)
+        self.class_names = names
+        self.class_names_source = source
 
-        # A classes.txt / dataset.yaml in the label folder is authoritative.
-        # Falling back to the question's own names is what makes a bare
-        # single-class CVAT export readable: every such export numbers its only
-        # class 0, so "0" means a hazard sign in one export and a GPS antenna in
-        # another. The active question is the only thing that disambiguates it.
-        self.class_names = load_class_names(self.annotation_dir)
-        self.class_names_source = "classes.txt / dataset.yaml"
-        if not self.class_names and question is not None:
-            self.class_names = list(getattr(question, "default_class_names", []) or [])
-            self.class_names_source = f"question {question.id!r} defaults"
+    # ── Class names, per folder ──────────────────────────────────────────────
+    def _names_for(self, folder: Path):
+        folder = Path(folder)
+        if folder not in self._names_cache:
+            names = load_class_names(folder)
+            source = f"{folder}/classes.txt"
+            if not names and self.question is not None:
+                # Every single-class CVAT export numbers its only class 0, so
+                # the id alone cannot say what it is. The selected question is
+                # the only thing that disambiguates it.
+                names = list(getattr(self.question, "default_class_names", []) or [])
+                source = f"question {self.question.id!r} defaults"
+            self._names_cache[folder] = (names, source)
+        return self._names_cache[folder]
 
-    def label_for(self, class_id: Optional[int], label_token: Optional[str]) -> str:
+    def label_for(self, class_id, label_token, names) -> str:
         if label_token is not None:
             return label_token
-        if class_id is not None and 0 <= class_id < len(self.class_names):
-            return self.class_names[class_id]
+        if class_id is not None and 0 <= class_id < len(names):
+            return names[class_id]
         return f"class_{class_id}"
 
-    def detect(self, image_bgr, stem: str, dest_path=None) -> DetectionStageResult:
-        height, width = image_bgr.shape[:2]
-        path = self.annotation_dir / f"{stem}.txt"
+    # ── Label file lookup ────────────────────────────────────────────────────
+    def label_path_for(self, stem: str, image_path=None):
+        """The sidecar beside the image wins; the configured folder is the
+        fallback. Returns None when neither exists."""
+        candidates = []
+        if image_path is not None:
+            candidates.append(Path(image_path).parent / f"{stem}.txt")
+        candidates.append(self.annotation_dir / f"{stem}.txt")
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
 
-        if not path.exists():
+    def detect(self, image_bgr, stem: str, dest_path=None,
+               image_path=None) -> DetectionStageResult:
+        height, width = image_bgr.shape[:2]
+        path = self.label_path_for(stem, image_path)
+
+        if path is None:
+            looked = [str(self.annotation_dir / f"{stem}.txt")]
+            if image_path is not None:
+                looked.insert(0, str(Path(image_path).parent / f"{stem}.txt"))
             # Zero detections, a prominent note, and NO exception - the VLM can
             # still answer from the image alone, so this must not stop the leg.
             return DetectionStageResult(
                 detections=[], annotated_path=None, model_name=self.name, is_stub=True,
-                note=f"no annotation file found for {stem}.txt in {self.annotation_dir}",
+                note=f"no annotation file found for {stem}.txt (looked in: "
+                     + ", ".join(looked) + ")",
             )
+
+        names, names_source = self._names_for(path.parent)
 
         detections: list[Detection] = []
         notes: list[str] = []
@@ -213,7 +255,7 @@ class AnnotationFileDetector:
         except OSError as exc:
             return DetectionStageResult(
                 detections=[], annotated_path=None, model_name=self.name, is_stub=True,
-                note=f"could not read {path.name}: {exc}",
+                note=f"could not read {path}: {exc}",
             )
 
         for lineno, raw in enumerate(lines, start=1):
@@ -230,7 +272,7 @@ class AnnotationFileDetector:
             if confidence is None:
                 confidence = _stub_confidence(stem, index, self.conf_range)
             detections.append(Detection(
-                label=self.label_for(parsed["class_id"], parsed["label_token"]),
+                label=self.label_for(parsed["class_id"], parsed["label_token"], names),
                 confidence=float(confidence),
                 box=parsed["box"],
                 source=SOURCE_ANNOTATION,
@@ -241,11 +283,11 @@ class AnnotationFileDetector:
         if any(d.label.startswith("class_") for d in detections):
             notes.append("no classes.txt, dataset.yaml or question default - "
                          "labels shown as class_<id>")
-        elif self.class_names_source.startswith("question"):
+        elif names_source.startswith("question"):
             # Say where the names came from. They are inferred from the selected
             # question, not read from the data, and that distinction matters if
             # the wrong question is picked for a folder.
-            notes.append(f"class names from {self.class_names_source}")
+            notes.append(f"class names from {names_source}")
 
         result = DetectionStageResult(
             detections=detections, annotated_path=None, model_name=self.name,
@@ -288,7 +330,10 @@ class ModelDetector:
         self.entry = entries[0]
         self.name = f"{self.entry['model']} ({self.entry['framework']})"
 
-    def detect(self, image_bgr, stem: str, dest_path=None) -> DetectionStageResult:
+    def detect(self, image_bgr, stem: str, dest_path=None,
+               image_path=None) -> DetectionStageResult:
+        # image_path is accepted for signature parity with the stub; a real
+        # model reads the array, never a sidecar file.
         annotated_bgr, raw = self._inference.run_inference(
             self.entry, image_bgr, conf_thresh=self.cfg.conf_thresh)
         detections = [Detection.from_model_dict(d, source=SOURCE_MODEL) for d in raw]

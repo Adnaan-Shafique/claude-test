@@ -158,6 +158,53 @@ r = detector().detect(FakeImage(1000, 1000), "high")
 check("unknown index falls back to class_7", r.detections[0].label == "class_7",
       r.detections[0].label)
 
+print("\nsidecar lookup - the label beside the photo wins")
+tree = Path(tempfile.mkdtemp())
+(tree / "hv").mkdir()
+(tree / "gps").mkdir()
+(tree / "hv" / "p1.jpg").touch()
+(tree / "hv" / "p1.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+(tree / "gps" / "p2.jpg").touch()
+(tree / "gps" / "p2.txt").write_text("0 0.25 0.25 0.1 0.1\n")
+
+from pipeline.questions import get_question as _gq          # noqa: E402
+from pipeline.stage2_detect import get_detector as _gd      # noqa: E402
+
+# annotation_dir points at the tree ROOT; the labels are a level down.
+det = _gd(default_config(annotation_dir=tree), question=_gq("hazard_warning"))
+r = det.detect(FakeImage(1000, 1000), "p1", image_path=tree / "hv" / "p1.jpg")
+check("sidecar found from the image's own folder", len(r.detections) == 1, r.note)
+check("sidecar label resolved via the question", r.detections[0].label == "hazard_sign",
+      r.detections[0].label)
+
+r = det.detect(FakeImage(1000, 1000), "p1")
+check("without image_path the root folder has no label -> honest miss",
+      r.detections == [] and "no annotation file found" in r.note, r.note)
+check("the miss note lists where it looked", "p1.txt" in r.note, r.note)
+
+# Per-folder class names: the same id 0 in a different folder with its own
+# classes.txt must not inherit the first folder's names.
+(tree / "gps" / "classes.txt").write_text("gps_antenna\n")
+r = det.detect(FakeImage(1000, 1000), "p2", image_path=tree / "gps" / "p2.jpg")
+check("class names come from the folder the label was found in",
+      r.detections[0].label == "gps_antenna", r.detections[0].label)
+
+# Central fallback still works when there is no sidecar.
+central = Path(tempfile.mkdtemp())
+(central / "p3.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+(tree / "hv" / "p3.jpg").touch()
+det2 = _gd(default_config(annotation_dir=central), question=_gq("hazard_warning"))
+r = det2.detect(FakeImage(1000, 1000), "p3", image_path=tree / "hv" / "p3.jpg")
+check("falls back to the central labels folder when no sidecar exists",
+      len(r.detections) == 1, r.note)
+
+check("recursive resolution finds labels in subfolders",
+      default_config().resolve_annotation_dir(tree) == tree,
+      str(default_config().resolve_annotation_dir(tree)))
+
+for d in (tree, central):
+    shutil.rmtree(d, ignore_errors=True)
+
 print("\ntwo single-class exports both numbering their class 0")
 from pipeline.questions import get_question   # noqa: E402
 from pipeline.stage2_detect import get_detector  # noqa: E402
