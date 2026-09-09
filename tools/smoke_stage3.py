@@ -127,7 +127,13 @@ def main() -> int:
             print(f"  detect    " + ", ".join(
                 f"{d.label} {d.confidence:.2f}" for d in det.detections))
         else:
-            print(f"  detect    none  ({det.note})")
+            print(f"  detect    none")
+        # Always show the note, not only on a miss. When names are inferred from
+        # the selected question rather than read from a classes.txt, that is
+        # exactly the run where you need to see it - a GPS antenna box labelled
+        # "hazard_sign" looks authoritative and is not.
+        if det.note:
+            print(f"  note      {det.note}")
 
         block = build_detection_block(relevant)
         print(f"  block     {block or '(none - the VLM answers from the image alone)'}")
