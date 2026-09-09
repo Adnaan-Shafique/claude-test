@@ -39,6 +39,10 @@ def main() -> int:
     cfg = default_config()
     if args.labels:
         cfg.annotation_dir = args.labels
+    else:
+        # Labels commonly sit beside the photos (the YOLO/CVAT sidecar layout).
+        source_dir = args.target if args.target.is_dir() else args.target.parent
+        cfg.annotation_dir = cfg.resolve_annotation_dir(source_dir)
 
     detector = get_detector(cfg)
     print(f"backend    : {detector.name}")

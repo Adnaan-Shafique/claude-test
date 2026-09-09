@@ -121,19 +121,27 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--images", type=Path, help="folder of demo photos")
-    ap.add_argument("--labels", type=Path, default=PROJECT_ROOT / "data" / "labels")
+    ap.add_argument("--labels", type=Path, default=None,
+                    help="label folder (default: the photo folder if it holds .txt "
+                         "files, else data/labels)")
     ap.add_argument("--check", action="store_true", help="report label coverage")
     ap.add_argument("--emit", action="store_true", help="scaffold missing label files")
     ap.add_argument("--force", action="store_true", help="overwrite existing labels on --emit")
     ap.add_argument("--classes", type=str, help="comma-separated names -> classes.txt")
     args = ap.parse_args()
 
+    if args.images and not args.images.is_dir():
+        raise SystemExit(f"Not a directory: {args.images}")
+
+    if args.labels is None:
+        from pipeline.config import default_config
+        args.labels = default_config().resolve_annotation_dir(args.images)
+        print(f"labels dir: {args.labels}  (auto-detected)\n")
+
     if args.classes:
         return do_classes(args.labels, args.classes)
     if not args.images:
         ap.error("--images is required for --check and --emit")
-    if not args.images.is_dir():
-        raise SystemExit(f"Not a directory: {args.images}")
     if args.emit:
         return do_emit(args.images, args.labels, args.force)
     if args.check:

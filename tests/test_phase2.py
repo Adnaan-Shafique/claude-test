@@ -158,6 +158,36 @@ r = detector().detect(FakeImage(1000, 1000), "high")
 check("unknown index falls back to class_7", r.detections[0].label == "class_7",
       r.detections[0].label)
 
+print("\nlabel-directory resolution - labels usually sit beside the photos")
+side = Path(tempfile.mkdtemp())
+(side / "a.jpg").touch()
+(side / "a.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+cfg = default_config()
+check("photo folder holding .txt files is chosen",
+      cfg.resolve_annotation_dir(side) == side, str(cfg.resolve_annotation_dir(side)))
+
+bare = Path(tempfile.mkdtemp())
+(bare / "a.jpg").touch()
+check("photo folder with no labels falls back to data/labels",
+      cfg.resolve_annotation_dir(bare) == cfg.project_root / "data" / "labels",
+      str(cfg.resolve_annotation_dir(bare)))
+
+only_classes = Path(tempfile.mkdtemp())
+(only_classes / "a.jpg").touch()
+(only_classes / "classes.txt").write_text("gps_antenna\n")
+check("a folder holding only classes.txt is not mistaken for a label folder",
+      cfg.resolve_annotation_dir(only_classes) != only_classes,
+      str(cfg.resolve_annotation_dir(only_classes)))
+
+explicit = default_config(annotation_dir=tmp)
+check("an explicit annotation_dir always wins",
+      explicit.resolve_annotation_dir(side) == tmp, str(explicit.resolve_annotation_dir(side)))
+check("resolution is safe with no images_dir at all",
+      cfg.resolve_annotation_dir(None) == cfg.project_root / "data" / "labels")
+
+for d in (side, bare, only_classes):
+    shutil.rmtree(d, ignore_errors=True)
+
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

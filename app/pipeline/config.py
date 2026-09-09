@@ -133,6 +133,26 @@ class PipelineConfig:
         os.environ.setdefault("U2NET_HOME", str(self.models_dir))
         return os.environ["U2NET_HOME"]
 
+    def resolve_annotation_dir(self, images_dir=None) -> Path:
+        """Where the label files actually are.
+
+        The YOLO/CVAT sidecar convention puts <stem>.txt next to <stem>.jpg in
+        the same folder, which is how the demo photos are laid out. An explicit
+        annotation_dir always wins; otherwise, if the photo folder carries .txt
+        files, that is the answer. Falling through to an empty data/labels would
+        report every image as "no annotation file found" - the detector working
+        perfectly and finding nothing, which is the confusing failure.
+        """
+        if self._annotation_dir is not None:
+            return self._annotation_dir
+        if images_dir is not None:
+            images_dir = Path(images_dir)
+            if images_dir.is_dir() and any(
+                q.name not in ("classes.txt", "obj.names") for q in images_dir.glob("*.txt")
+            ):
+                return images_dir
+        return self.annotation_dir
+
     def segmentation_model_path(self) -> Path:
         return self.models_dir / f"{self.segmentation_model}.onnx"
 

@@ -351,12 +351,15 @@ def check_vendored_modules() -> None:
                  f"(expected until the dependencies above are installed)")
 
 
-def check_annotations() -> None:
+def check_annotations(labels_dir=None) -> None:
     section("Annotation files (stub detector)")
-    labels = PROJECT_ROOT / "data" / "labels"
+    # Labels commonly live beside the photos rather than in data/labels - pass
+    # --labels to check where they actually are.
+    labels = Path(labels_dir) if labels_dir else PROJECT_ROOT / "data" / "labels"
     if not labels.exists():
         warn(f"{labels} does not exist - every image will report "
-             f"'no annotation file found'")
+             f"'no annotation file found'. If the labels sit beside the photos "
+             f"(the usual YOLO/CVAT layout), re-run with --labels <photo dir>.")
         return
     txts = sorted(p for p in labels.glob("*.txt") if p.name != "classes.txt")
     ok(f"{labels} has {len(txts)} label file(s)")
@@ -378,6 +381,9 @@ def main() -> int:
     ap.add_argument("--offline-check", action="store_true",
                     help="interactively verify u2netp loads with the network down")
     ap.add_argument("--skip-gpu", action="store_true")
+    ap.add_argument("--labels", type=Path, default=None,
+                    help="folder holding the <stem>.txt label files, if not data/labels "
+                         "(commonly the photo folder itself)")
     args = ap.parse_args()
 
     print(f"Preflight for {PROJECT_ROOT}")
@@ -387,7 +393,7 @@ def main() -> int:
     check_u2netp(args.offline_check)
     check_vendored_modules()
     check_pipeline_imports()
-    check_annotations()
+    check_annotations(args.labels)
     if not args.skip_gpu:
         check_gpu(args.gpu_url)
     check_ports()
