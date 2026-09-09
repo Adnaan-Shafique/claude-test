@@ -158,6 +158,60 @@ r = detector().detect(FakeImage(1000, 1000), "high")
 check("unknown index falls back to class_7", r.detections[0].label == "class_7",
       r.detections[0].label)
 
+print("\ntwo single-class exports both numbering their class 0")
+from pipeline.questions import get_question   # noqa: E402
+from pipeline.stage2_detect import get_detector  # noqa: E402
+
+hv = Path(tempfile.mkdtemp())      # the HV Hazardous Radiations export
+gps = Path(tempfile.mkdtemp())     # a GPS Antenna export, added later
+(hv / "hv_photo.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+(gps / "gps_photo.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+
+hazard_q = get_question("hazard_warning")
+antenna_q = get_question("gps_antenna")
+
+d_hv = get_detector(default_config(annotation_dir=hv), question=hazard_q)
+r_hv = d_hv.detect(FakeImage(1000, 1000), "hv_photo")
+check("class 0 reads as hazard_sign under the hazard question",
+      r_hv.detections[0].label == "hazard_sign", r_hv.detections[0].label)
+
+d_gps = get_detector(default_config(annotation_dir=gps), question=antenna_q)
+r_gps = d_gps.detect(FakeImage(1000, 1000), "gps_photo")
+check("the SAME class id 0 reads as gps_antenna under the antenna question",
+      r_gps.detections[0].label == "gps_antenna", r_gps.detections[0].label)
+
+check("the note says the names came from the question, not the data",
+      "question" in r_hv.note, r_hv.note)
+
+# A real classes.txt must beat the question's guess.
+(hv / "classes.txt").write_text("HV_warning_placard\n")
+d_hv2 = get_detector(default_config(annotation_dir=hv), question=hazard_q)
+r_hv2 = d_hv2.detect(FakeImage(1000, 1000), "hv_photo")
+check("a classes.txt in the folder overrides the question default",
+      r_hv2.detections[0].label == "HV_warning_placard", r_hv2.detections[0].label)
+check("no question-provenance note once the folder supplies names",
+      "question" not in r_hv2.note, r_hv2.note)
+
+# Per-question folders, so both exports can coexist.
+both = default_config()
+both.annotation_dirs = {"hazard_warning": hv, "gps_antenna": gps}
+check("per-question folder chosen for hazard_warning",
+      both.resolve_annotation_dir(question_id="hazard_warning") == hv)
+check("per-question folder chosen for gps_antenna",
+      both.resolve_annotation_dir(question_id="gps_antenna") == gps)
+check("an unmapped question still falls back",
+      both.resolve_annotation_dir(question_id="something_else")
+      == both.project_root / "data" / "labels")
+
+# With no question at all, ids stay honest rather than guessing.
+d_bare = get_detector(default_config(annotation_dir=gps))
+r_bare = d_bare.detect(FakeImage(1000, 1000), "gps_photo")
+check("no question -> class_0, never an invented name",
+      r_bare.detections[0].label == "class_0", r_bare.detections[0].label)
+
+for d in (hv, gps):
+    shutil.rmtree(d, ignore_errors=True)
+
 print("\nlabel-directory resolution - labels usually sit beside the photos")
 side = Path(tempfile.mkdtemp())
 (side / "a.jpg").touch()

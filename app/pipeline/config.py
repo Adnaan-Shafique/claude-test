@@ -86,6 +86,7 @@ class PipelineConfig:
     # ── Output ───────────────────────────────────────────────────────────────
     run_id: Optional[str] = None
     _annotation_dir: Optional[Path] = field(default=None, repr=False)
+    _annotation_dirs: Optional[dict] = field(default=None, repr=False)
     _runs_dir: Optional[Path] = field(default=None, repr=False)
     _models_dir: Optional[Path] = field(default=None, repr=False)
 
@@ -133,7 +134,22 @@ class PipelineConfig:
         os.environ.setdefault("U2NET_HOME", str(self.models_dir))
         return os.environ["U2NET_HOME"]
 
-    def resolve_annotation_dir(self, images_dir=None) -> Path:
+    @property
+    def annotation_dirs(self) -> dict:
+        """Optional per-question label folders, keyed by question id.
+
+        Separate CVAT tasks export to separate folders, and keeping them
+        separate is the only layout that stays correct once two single-class
+        exports both number their class 0. Empty means every question shares
+        annotation_dir.
+        """
+        return self._annotation_dirs or {}
+
+    @annotation_dirs.setter
+    def annotation_dirs(self, value) -> None:
+        self._annotation_dirs = {k: Path(v) for k, v in (value or {}).items()}
+
+    def resolve_annotation_dir(self, images_dir=None, question_id=None) -> Path:
         """Where the label files actually are.
 
         The YOLO/CVAT sidecar convention puts <stem>.txt next to <stem>.jpg in
@@ -143,6 +159,8 @@ class PipelineConfig:
         report every image as "no annotation file found" - the detector working
         perfectly and finding nothing, which is the confusing failure.
         """
+        if question_id and question_id in self.annotation_dirs:
+            return self.annotation_dirs[question_id]
         if self._annotation_dir is not None:
             return self._annotation_dir
         if images_dir is not None:

@@ -168,11 +168,24 @@ class AnnotationFileDetector:
     is_stub = True
     name = STUB_MODEL_NAME
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, question=None, annotation_dir=None):
         self.cfg = cfg
-        self.annotation_dir = Path(cfg.annotation_dir)
-        self.class_names = load_class_names(self.annotation_dir)
+        self.question = question
+        self.annotation_dir = Path(
+            annotation_dir if annotation_dir is not None
+            else cfg.resolve_annotation_dir(question_id=getattr(question, "id", None)))
         self.conf_range = tuple(cfg.stub_conf_range)
+
+        # A classes.txt / dataset.yaml in the label folder is authoritative.
+        # Falling back to the question's own names is what makes a bare
+        # single-class CVAT export readable: every such export numbers its only
+        # class 0, so "0" means a hazard sign in one export and a GPS antenna in
+        # another. The active question is the only thing that disambiguates it.
+        self.class_names = load_class_names(self.annotation_dir)
+        self.class_names_source = "classes.txt / dataset.yaml"
+        if not self.class_names and question is not None:
+            self.class_names = list(getattr(question, "default_class_names", []) or [])
+            self.class_names_source = f"question {question.id!r} defaults"
 
     def label_for(self, class_id: Optional[int], label_token: Optional[str]) -> str:
         if label_token is not None:
@@ -225,8 +238,14 @@ class AnnotationFileDetector:
 
         if not detections and not notes:
             notes.append(f"{path.name} contains no usable annotation lines")
-        if not self.class_names and any(d.label.startswith("class_") for d in detections):
-            notes.append("no classes.txt or dataset.yaml - labels shown as class_<id>")
+        if any(d.label.startswith("class_") for d in detections):
+            notes.append("no classes.txt, dataset.yaml or question default - "
+                         "labels shown as class_<id>")
+        elif self.class_names_source.startswith("question"):
+            # Say where the names came from. They are inferred from the selected
+            # question, not read from the data, and that distinction matters if
+            # the wrong question is picked for a folder.
+            notes.append(f"class names from {self.class_names_source}")
 
         result = DetectionStageResult(
             detections=detections, annotated_path=None, model_name=self.name,
@@ -284,9 +303,16 @@ class ModelDetector:
         return result
 
 
-def get_detector(cfg):
-    """The one switch. cfg.use_model=False (the default) gives the stub."""
-    return ModelDetector(cfg) if cfg.use_model else AnnotationFileDetector(cfg)
+def get_detector(cfg, question=None, annotation_dir=None):
+    """The one switch. cfg.use_model=False (the default) gives the stub.
+
+    `question` lets the stub resolve class ids the way that question's own
+    annotation export numbered them, and selects a per-question label folder
+    when cfg.annotation_dirs has one.
+    """
+    if cfg.use_model:
+        return ModelDetector(cfg)
+    return AnnotationFileDetector(cfg, question=question, annotation_dir=annotation_dir)
 
 
 # ─────────────────────────────── Rendering ───────────────────────────────────

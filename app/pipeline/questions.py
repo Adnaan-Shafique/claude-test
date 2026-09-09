@@ -93,6 +93,18 @@ class Question:
     user_template: str                # PER QUESTION - .format(**ctx)
     answer_semantics: str             # human-readable yes/no meaning, shown in the UI
     relevant_classes: list[str]       # detector labels to surface / crop to
+    # Class names for THIS question's annotation export, indexed by class_id.
+    #
+    # Each CVAT export is a separate single-class task, so every one of them
+    # numbers its only class 0. "0" therefore means a hazard sign in the HV
+    # export and a GPS antenna in the antenna export - the same id, two
+    # meanings. A single shared classes.txt cannot express that, and guessing
+    # wrong injects a false label into {detection_block}, which the prompt
+    # explicitly tells the model to weigh as evidence.
+    #
+    # A real classes.txt or dataset.yaml in the label folder always wins; this
+    # is the fallback that makes a bare single-class export readable.
+    default_class_names: list[str] = field(default_factory=list)
     sampling: dict = field(default_factory=dict)   # optional per-question overrides
 
     def __post_init__(self) -> None:
@@ -120,11 +132,11 @@ QUESTIONS: dict[str, Question] = {
             "YES = a hazard/warning/danger sign or safety placard is visible.  "
             "NO = no such signage anywhere in the frame."
         ),
-        # TODO: confirm against the annotators' real class list. The sample
-        # annotation carries class_id 0 with no classes.txt, so the resolved
-        # label may be "class_0" until one is supplied. select_relevant() below
-        # degrades safely when nothing matches.
+        # The HV export labels its single class 0; default_class_names below
+        # resolves that to "hazard_sign" without a classes.txt. select_relevant()
+        # still degrades safely if a folder uses different names.
         relevant_classes=["hazard_sign", "warning_sign", "hazard", "sign", "placard"],
+        default_class_names=["hazard_sign"],
     ),
     "gps_antenna": Question(
         id="gps_antenna",
@@ -136,6 +148,7 @@ QUESTIONS: dict[str, Question] = {
             "NO = its view of the sky is blocked or partially blocked."
         ),
         relevant_classes=["gps_antenna", "gps", "antenna"],
+        default_class_names=["gps_antenna"],
     ),
 }
 

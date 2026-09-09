@@ -29,10 +29,14 @@ def main() -> int:
     ap.add_argument("target", type=Path)
     ap.add_argument("--limit", type=int, default=5)
     ap.add_argument("--labels", type=Path, default=None)
+    ap.add_argument("--question", default="hazard_warning",
+                    help="which question's class names to resolve ids with "
+                         "(hazard_warning | gps_antenna)")
     ap.add_argument("--out", type=Path, default=PROJECT_ROOT / "demo_runs" / "smoke_detect")
     args = ap.parse_args()
 
     from pipeline.config import default_config
+    from pipeline.questions import get_question
     from pipeline.stage2_detect import get_detector, render
     from quality_check import load_image_bgr
 
@@ -44,11 +48,14 @@ def main() -> int:
         source_dir = args.target if args.target.is_dir() else args.target.parent
         cfg.annotation_dir = cfg.resolve_annotation_dir(source_dir)
 
-    detector = get_detector(cfg)
+    question = get_question(args.question)
+    detector = get_detector(cfg, question=question)
     print(f"backend    : {detector.name}")
     print(f"is_stub    : {detector.is_stub}")
-    print(f"labels dir : {cfg.annotation_dir}")
-    print(f"classes    : {getattr(detector, 'class_names', None) or 'NONE (class_<id>)'}\n")
+    print(f"question   : {question.id}  ({question.label})")
+    print(f"labels dir : {detector.annotation_dir}")
+    print(f"classes    : {getattr(detector, 'class_names', None) or 'NONE (class_<id>)'}"
+          f"  [from {getattr(detector, 'class_names_source', '?')}]\n")
 
     paths = ([args.target] if args.target.is_file() else
              sorted(p for p in args.target.rglob("*")
