@@ -73,12 +73,26 @@ def check_imports() -> None:
     section("Dependencies")
     required = ["cv2", "numpy", "PIL", "pandas", "requests", "gradio"]
     optional = ["rembg", "onnxruntime", "torch", "ultralytics", "dash"]
+    missing_required = []
     for mod in required:
         try:
             m = __import__(mod)
             ok(f"{mod} {getattr(m, '__version__', '(no __version__)')}")
         except ImportError as exc:
             fail(f"{mod} is missing - {exc}")
+            missing_required.append(mod)
+
+    # requests is a dependency of almost everything here. If even it is absent,
+    # this is an empty virtualenv rather than a set of individual gaps - one
+    # cause, not six, and the fix is different.
+    if "requests" in missing_required and len(missing_required) >= 4:
+        print(f"\n  NOTE  {len(missing_required)} of {len(required)} core packages are missing, "
+              f"including requests.\n"
+              f"        This looks like an EMPTY virtualenv ({sys.prefix}),\n"
+              f"        not a machine missing individual packages.\n"
+              f"        Prefer cloning the environment that already runs the existing tools\n"
+              f"        (pip freeze from it) over resolving fresh versions - that also pins\n"
+              f"        the one Gradio version both UI patterns are known to work under.")
     for mod in optional:
         try:
             m = __import__(mod)
@@ -153,6 +167,16 @@ def check_u2netp(offline_check: bool) -> None:
 
     if offline_check:
         section("u2netp offline load (this is the one that matters)")
+        # Only meaningful once rembg is importable. Asking someone to pull the
+        # network and then failing with "No module named 'rembg'" tests nothing
+        # and wastes a step - check that first.
+        try:
+            import rembg  # noqa: F401
+        except ImportError:
+            warn("skipping the offline load check - rembg is not installed, so this "
+                 "would only re-report the missing dependency. Install the deps, "
+                 "then re-run with --offline-check.")
+            return
         print("  Disconnect the network NOW, then press Enter to load the model...")
         try:
             input()
