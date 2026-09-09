@@ -1,0 +1,33 @@
+# Integrated demo pipeline - FALCONPRD, python 3.12, stub-detector mode.
+#
+# Constraints are lower bounds with upper guards only where a major version is
+# known to change behaviour we depend on. They are BEST EFFORT - they have not
+# been resolved on a machine with network access. Verify with:
+#     python tools/preflight.py --skip-gpu
+# after installing, and re-pin anything that resolves badly.
+
+# ── Core image + data ────────────────────────────────────────────────────────
+numpy>=1.26,<3
+pillow>=10.2
+pandas>=2.2
+requests>=2.31
+
+# opencv-python-headless, NOT opencv-python. FALCONPRD is a server; the non
+# headless wheel links libGL.so.1 and friends, which are usually absent on a
+# headless host and fail at `import cv2` with an OSError, not a pip error.
+# Both wheels provide the same `cv2` module, so quality_check.py cannot tell.
+opencv-python-headless>=4.9
+
+# ── UI ───────────────────────────────────────────────────────────────────────
+# Held below 6 deliberately. gradio 6 moved css=/head= from the Blocks
+# constructor to launch(); vlm_test_client_v2._theme_kwargs() handles both, but
+# a single 4/5-series pin is one less thing to be wrong on stage. gr.skip(),
+# which the batch UI's _emit() depends on, exists from 4.x onward.
+gradio>=4.44,<6
+
+# ── Stage 1 segmentation ─────────────────────────────────────────────────────
+# rembg pulls a large transitive set (scipy, scikit-image, pymatting, pooch)
+# for alpha matting we never use - get_foreground_box() calls remove() with
+# only_mask=True. If the resolve fights you, see SETUP.md for the slim path.
+rembg>=2.0.57
+onnxruntime>=1.17

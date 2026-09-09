@@ -296,6 +296,61 @@ def check_pipeline_imports() -> None:
         warn(problem)
 
 
+def check_vendored_modules() -> None:
+    """The two files from the original toolset that stage 1 imports.
+
+    The originals do not run on the demo host, so the integrated pipeline
+    carries its own copies. Without them stage1_quality.py raises ImportError
+    and there is no quality gate at all - a louder failure than it looks,
+    because the pipeline package itself still imports fine.
+    """
+    section("Vendored source modules")
+    app_dir = PROJECT_ROOT / "app"
+    needed = {
+        "quality_check.py": ["assess_quality", "QualityConfig", "load_image_bgr", "CUE_MESSAGES"],
+        "foreground_segmentation.py": ["get_foreground_box", "preload", "draw_box",
+                                       "DEFAULT_MODEL_NAME"],
+    }
+    all_present = True
+    for name, symbols in needed.items():
+        path = app_dir / name
+        if not path.exists():
+            fail(f"{path} missing - copy it from the original toolset (see SETUP.md step 1). "
+                 f"stage1_quality.py imports {', '.join(symbols)} from it.")
+            all_present = False
+            continue
+        text = path.read_text(errors="replace")
+        absent = [sym for sym in symbols if sym not in text]
+        if absent:
+            warn(f"{name} present but does not mention: {', '.join(absent)} "
+                 f"- is this the same version stage 1 was written against?")
+        else:
+            ok(f"{name} present, defines all {len(symbols)} symbols stage 1 needs")
+
+    # foreground_segmentation.py computes MODELS_DIR as parent.parent/"models".
+    # Placed at app/, that resolves to <root>/models where u2netp.onnx lives.
+    # Anywhere else and rembg looks in the wrong directory and tries to download.
+    fseg = app_dir / "foreground_segmentation.py"
+    if fseg.exists():
+        resolved = fseg.resolve().parent.parent / "models"
+        if resolved == (PROJECT_ROOT / "models").resolve():
+            ok(f"foreground_segmentation.py's MODELS_DIR resolves to {resolved}")
+        else:
+            fail(f"foreground_segmentation.py is at {fseg}, so its MODELS_DIR resolves to "
+                 f"{resolved}, NOT {PROJECT_ROOT / 'models'} - rembg will not find u2netp.onnx. "
+                 f"Move it to {app_dir}/")
+
+    if all_present:
+        try:
+            sys.path.insert(0, str(app_dir))
+            import quality_check  # noqa: F401
+            import foreground_segmentation  # noqa: F401
+            ok("both vendored modules import cleanly")
+        except ImportError as exc:
+            warn(f"vendored modules present but not importable yet: {exc} "
+                 f"(expected until the dependencies above are installed)")
+
+
 def check_annotations() -> None:
     section("Annotation files (stub detector)")
     labels = PROJECT_ROOT / "data" / "labels"
@@ -330,6 +385,7 @@ def main() -> int:
     check_imports()
     check_gradio_version()
     check_u2netp(args.offline_check)
+    check_vendored_modules()
     check_pipeline_imports()
     check_annotations()
     if not args.skip_gpu:
