@@ -19,6 +19,9 @@ requests>=2.31
 opencv-python-headless>=4.9
 
 # ── UI ───────────────────────────────────────────────────────────────────────
+# The integrated demo UI (app/demo_dash.py). Dash 3 renamed app.run_server to
+# app.run; this app uses app.run, which exists in 2.16+ as well.
+dash>=2.16
 # Held below 6 deliberately. gradio 6 moved css=/head= from the Blocks
 # constructor to launch(); vlm_test_client_v2._theme_kwargs() handles both, but
 # a single 4/5-series pin is one less thing to be wrong on stage. gr.skip(),
