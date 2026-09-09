@@ -1,4 +1,11 @@
 """
+VENDORED, MODIFIED. This is a copy of the original foreground_segmentation.py
+carried by the integrated demo pipeline, because the original toolset does not
+run on the demo host. One function differs from upstream: _get_session() is now
+tolerant of rembg versions that no longer accept a sess_opts keyword (see the
+comment there). Do not merge this file back over the original without carrying
+that change with it.
+
 Automatic foreground/background separation - a training-data curation tool,
 NOT part of the runtime edge/server pipeline.
 
@@ -82,7 +89,35 @@ def _get_session(model_name: str, sess_opts=None):
             "  pip install rembg onnxruntime\n"
             "The model weights download automatically on first use."
         ) from exc
-    _session = new_session(model_name, sess_opts=sess_opts)
+
+    # MODIFIED FROM THE ORIGINAL - see the "Vendored, modified" note at the top
+    # of this file.
+    #
+    # rembg >= ~2.0.6x builds its own ort.SessionOptions inside new_session()
+    # and hands it to the session class POSITIONALLY:
+    #
+    #     return session_class(model_name, sess_opts, providers, *args, **kwargs)
+    #
+    # so passing sess_opts= as a keyword makes it a second value for the same
+    # parameter: "BaseSession.__init__() got multiple values for argument
+    # 'sess_opts'". That fired even for sess_opts=None, which made the segmenter
+    # unloadable on rembg 2.0.69 regardless of what the caller asked for.
+    if sess_opts is None:
+        _session = new_session(model_name)
+    else:
+        try:
+            _session = new_session(model_name, sess_opts=sess_opts)
+        except TypeError:
+            # This rembg no longer accepts the keyword. It does read
+            # OMP_NUM_THREADS for inter_op_num_threads, so translate the caller's
+            # intent into the lever this version actually exposes rather than
+            # silently dropping the thread cap - run_quality_batch_foreground.py
+            # relies on it to stop N worker processes oversubscribing the box.
+            requested = getattr(sess_opts, "intra_op_num_threads", 0) or \
+                getattr(sess_opts, "inter_op_num_threads", 0)
+            if requested:
+                os.environ["OMP_NUM_THREADS"] = str(int(requested))
+            _session = new_session(model_name)
     _session_model_name = model_name
     return _session
 
