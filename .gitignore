@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Per-run outputs
+demo_runs/
+batch_runs/
+
+# Model weights: u2netp.onnx is deliberately committed (see models/README.md) so
+# the demo never depends on a first-run download. Everything else stays out.
+models/*.onnx
+!models/u2netp.onnx
