@@ -37,9 +37,20 @@ second. If the order differs, correct the Class names field in the UI (or
 `yolox_class_names` in `pipeline/config.py`) — a swap does not error, it puts a
 confident wrong label on screen and into the model prompt as evidence.
 
-## Then
+## Then — a separate venv, so demo_venv is never touched
+
+`demo_venv` keeps running the frozen annotation demo on 7870. The detector gets
+its own environment.
 
 ```bash
+# Same base interpreter that built demo_venv - check, do not assume:
+head -3 demo_venv/pyvenv.cfg
+
+python3.12 -m venv venv_yolox
+source venv_yolox/bin/activate
+
+pip install --upgrade pip setuptools wheel
+pip install -r requirements-demo.txt          # known to resolve here: demo_venv used it
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install loguru psutil
 

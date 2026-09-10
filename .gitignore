@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+venv_*/
+demo_venv/
 
 # Per-run outputs
 demo_runs/
@@ -11,3 +13,9 @@ batch_runs/
 # the demo never depends on a first-run download. Everything else stays out.
 models/*.onnx
 !models/u2netp.onnx
+
+# The YOLOX checkpoint - ~70MB, copied from AISERVER per COPY_FROM_AISERVER.md,
+# not source. Note this pattern is anchored with a leading slash: an unanchored
+# "models/" is what silently swallowed src/YOLOX/yolox/models in the field-ops
+# repo, and app/vendor/yolox/models must stay tracked.
+/models/*.pth
