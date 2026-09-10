@@ -11,6 +11,11 @@ The demo-ready state, verified end to end on FALCONPRD against the live GPU
 server. Do not change `app/demo_dash.py` — the YOLOX version is a separate
 file so this one stays runnable as a fallback.
 
+`app/assets/demo.css` has since gained a `.dropzone` / `.or-rule` block for the
+YOLOX UI's upload control. That change is **additive only** — no existing
+selector was modified — so `demo_dash.py` renders exactly as it did at this
+commit.
+
 Restore with:
 
     git checkout f978b7df790f312a096977a4bd103b9c66f13948 -- app/demo_dash.py app/assets/demo.css

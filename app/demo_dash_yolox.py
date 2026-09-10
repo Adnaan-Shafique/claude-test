@@ -19,6 +19,7 @@ pipeline/yolox_runtime.py for why the non-square input size matters.
 """
 from __future__ import annotations
 
+import base64
 import os
 import sys
 import traceback
@@ -31,8 +32,8 @@ from dash import Dash, Input, Output, State, dash_table, dcc, html, no_update  #
 
 from pipeline.config import (SEND_FULL, SEND_FULL_CROP, VLM_MODE_LIVE,  # noqa: E402
                              VLM_MODE_MOCK, default_config)
-from pipeline.orchestrator import (collect_images, run_pipeline,  # noqa: E402
-                                   sort_for_display, summarise)
+from pipeline.orchestrator import (collect_images, new_run_id,  # noqa: E402
+                                   run_pipeline, sort_for_display, summarise)
 from pipeline.questions import QUESTIONS, get_question  # noqa: E402
 
 # Shared renderers - see the module docstring on why these are imported.
@@ -113,10 +114,21 @@ def controls():
                 html.Label("Folder on this machine", htmlFor="folder"),
                 dcc.Input(id="folder", type="text", debounce=True,
                           placeholder="/data/adnaan/fieldops/demo/photos"),
-                html.Div("The detector reads the image, so no annotation sidecars "
-                         "are needed here - point at any folder of photos.",
-                         className="field-help"),
             ], className="field"),
+            html.Div("or", className="or-rule"),
+            # Upload is fully supported here, unlike the annotation version:
+            # that one needed a .txt sidecar beside each photo and a browser
+            # upload cannot carry one. A trained detector reads the image, so
+            # dragging a photo straight off a laptop works end to end.
+            dcc.Upload(id="uploads", multiple=True, className="dropzone",
+                       accept="image/*", children=html.Div([
+                           html.Div("Drop images here, or click to browse",
+                                    className="dz-main"),
+                           html.Div("JPG, PNG, TIFF · the detector reads the image "
+                                    "directly, so no annotation files are needed",
+                                    className="dz-sub"),
+                       ])),
+            html.Div(id="upload-note", className="dz-list"),
         ], className="card"),
 
         html.Div([
@@ -234,6 +246,16 @@ def on_question(question_id):
     return get_question(question_id).answer_semantics, prompt_text(question_id)
 
 
+@app.callback(Output("upload-note", "children"), Input("uploads", "filename"))
+def on_upload(filenames):
+    if not filenames:
+        return ""
+    shown = ", ".join(filenames[:4]) + (f" +{len(filenames) - 4} more"
+                                        if len(filenames) > 4 else "")
+    return [html.Span(f"{len(filenames)} file(s) ready", className="dz-count"),
+            html.Span(f" — {shown}")]
+
+
 @app.callback(Output("status", "children"), Input("check", "n_clicks"),
               State("ckpt", "value"), State("classes", "value"), State("conf", "value"),
               State("nms", "value"), State("size-h", "value"), State("size-w", "value"),
@@ -282,14 +304,16 @@ def on_check(_clicks, ckpt, classes, conf, nms, size_h, size_w, flags, gpu_url):
               Output("status", "children", allow_duplicate=True),
               Input("run", "n_clicks"), Input("tabs", "value"),
               State("question", "value"), State("folder", "value"),
+              State("uploads", "contents"), State("uploads", "filename"),
               State("ckpt", "value"), State("classes", "value"), State("conf", "value"),
               State("nms", "value"), State("size-h", "value"), State("size-w", "value"),
               State("threshold", "value"), State("flags", "value"),
               State("gpu-url", "value"), State("vlm-model", "value"),
               State("vlm-mode", "value"), State("send-mode", "value"),
               prevent_initial_call="initial_duplicate")
-def on_run(n_clicks, tab, question_id, folder, ckpt, classes, conf, nms, size_h,
-           size_w, threshold, flags, gpu_url, vlm_model, vlm_mode, send_mode):
+def on_run(n_clicks, tab, question_id, folder, upload_contents, upload_names,
+           ckpt, classes, conf, nms, size_h, size_w, threshold, flags, gpu_url,
+           vlm_model, vlm_mode, send_mode):
     import dash
     triggered = (dash.callback_context.triggered[0]["prop_id"].split(".")[0]
                  if dash.callback_context.triggered else "")
@@ -298,10 +322,6 @@ def on_run(n_clicks, tab, question_id, folder, ckpt, classes, conf, nms, size_h,
     if triggered != "run":
         return _panel(tab, question), no_update
 
-    if not folder or not folder.strip():
-        msg = "Point at a photo folder on this machine."
-        return (html.Div(msg, className="empty"),
-                [html.Span(className="dot dot-warn"), html.Span(msg)])
 
     cfg = _cfg_from_controls(ckpt, classes, conf, nms, size_h, size_w, flags,
                              gpu_url, vlm_model, vlm_mode, send_mode, threshold, flags)
@@ -312,16 +332,10 @@ def on_run(n_clicks, tab, question_id, folder, ckpt, classes, conf, nms, size_h,
                          className="card"),
                 [html.Span(className="dot dot-bad"), html.Span(blocking[0])])
 
-    root = Path(folder.strip())
-    if not root.exists():
-        msg = f"No such folder: {root}"
-        return (html.Div(msg, className="empty"),
-                [html.Span(className="dot dot-bad"), html.Span(msg)])
-    paths = collect_images(root)
+    paths, source = _resolve_inputs(folder, upload_contents, upload_names, cfg)
     if not paths:
-        msg = f"No images found under {root}."
-        return (html.Div(msg, className="empty"),
-                [html.Span(className="dot dot-warn"), html.Span(msg)])
+        return (html.Div(source, className="empty"),
+                [html.Span(className="dot dot-warn"), html.Span(source)])
 
     try:
         records = run_pipeline(paths, question.id, cfg)
@@ -334,12 +348,51 @@ def on_run(n_clicks, tab, question_id, folder, ckpt, classes, conf, nms, size_h,
     s = summarise(records)
     n_boxes = sum(len(r.detection.detections) for r in records if r.detection)
     status = [html.Span(className="dot dot-ok"),
-              html.Span(f"Done — {s['total']} photo(s) · {s['passed']} pass, "
+              html.Span(f"Done — {s['total']} photo(s) from {source} · "
+                        f"{s['passed']} pass, "
                         f"{s['failed']} fail · {n_boxes} detection(s) · "
                         + ", ".join(f"{k.upper()} {n}"
                                     for k, n in sorted(s["answers"].items()))
                         + (f" · {s['mocked']} MOCK" if s["mocked"] else ""))]
     return _panel(tab, question), status
+
+
+def _resolve_inputs(folder, upload_contents, upload_names, cfg):
+    """Folder path wins when given; uploads otherwise. Returns (paths, source)
+    or ([], message) when there is nothing to run."""
+    if folder and folder.strip():
+        root = Path(folder.strip())
+        if not root.exists():
+            return [], f"No such folder: {root}"
+        paths = collect_images(root)
+        if not paths:
+            return [], f"No images found under {root}."
+        return paths, str(root)
+
+    if upload_contents:
+        # Uploads arrive base64 in the callback. Stage them to disk so every
+        # stage sees a real path, exactly as a folder run would - the quality
+        # leg re-reads the file and the run folder keeps a copy of what was
+        # actually processed.
+        if cfg.run_id is None:
+            cfg.run_id = new_run_id()
+        staged = cfg.runs_dir / "uploads" / cfg.run_id
+        staged.mkdir(parents=True, exist_ok=True)
+        paths, skipped = [], 0
+        for content, name in zip(upload_contents, upload_names or []):
+            try:
+                _, b64 = content.split(",", 1)
+                dest = staged / Path(name).name
+                dest.write_bytes(base64.b64decode(b64))
+                paths.append(dest)
+            except Exception:
+                skipped += 1
+        if not paths:
+            return [], "None of the uploaded files could be decoded."
+        note = f"{len(paths)} uploaded file(s)"
+        return paths, note + (f" ({skipped} skipped)" if skipped else "")
+
+    return [], "Drop images above, or point at a photo folder on this machine."
 
 
 def _panel(tab, question):

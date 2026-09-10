@@ -32,8 +32,10 @@ class Node:
 
     def text(self) -> str:
         """Flatten this tree to searchable text: class names, titles and strings."""
+        # id included: component ids are how callbacks find things, so a test
+        # asserting a control exists needs to see them.
         bits = [str(self.kw.get("className", "")), str(self.kw.get("title", "")),
-                str(self.kw.get("alt", ""))]
+                str(self.kw.get("alt", "")), str(self.kw.get("id", ""))]
         c = self.children
         if isinstance(c, (list, tuple)):
             for item in c:
@@ -191,6 +193,31 @@ check("user prompt shown", "USER PROMPT" in text)
 check("the gps system prompt is the one rendered", "GPS antenna" in text)
 check("switching question switches the pair",
       "site-safety inspector" in ui.prompt_text("hazard_warning"))
+
+print("\nYOLOX UI - upload works here, unlike the annotation version")
+# The annotation UI deliberately has no upload: it needs a .txt sidecar beside
+# each photo and a browser upload cannot carry one. A trained detector reads the
+# image, so uploading is fully supported - and is the better demo.
+spec_y = importlib.util.spec_from_file_location("demo_dash_yolox",
+                                                ROOT / "app" / "demo_dash_yolox.py")
+yolox_ui = importlib.util.module_from_spec(spec_y)
+spec_y.loader.exec_module(yolox_ui)
+layout_text = yolox_ui.layout().text()
+
+check("a dropzone is present", "dropzone" in layout_text)
+check("the upload component is wired", "uploads" in layout_text)
+check("staged-file feedback has a home", "upload-note" in layout_text)
+check("the folder path is still offered", "folder" in layout_text)
+
+src = (ROOT / "app" / "demo_dash_yolox.py").read_text()
+check("uploads are staged to disk, not passed as base64 downstream",
+      "dest.write_bytes(base64.b64decode(b64))" in src)
+check("a folder path takes precedence over uploads",
+      src.index("if folder and folder.strip():") < src.index("if upload_contents:"))
+check("the empty state names both inputs",
+      "Drop images above, or point at a photo folder" in src)
+check("run_id is set before staging, so uploads land in this run's folder",
+      "cfg.run_id = new_run_id()" in src)
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
