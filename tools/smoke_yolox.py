@@ -32,7 +32,13 @@ def main() -> int:
     ap.add_argument("--nms", type=float, default=0.65)
     ap.add_argument("--height", type=int, default=640)
     ap.add_argument("--width", type=int, default=480)
-    ap.add_argument("--classes", default="hazard_sign,gps_antenna")
+    # No hardcoded default. A stale literal here silently overrides
+    # cfg.yolox_class_names and reports the wrong labels while the config is
+    # correct - which is exactly what happened, and it cost a round of
+    # "the model has the classes backwards" that it did not.
+    ap.add_argument("--classes", default=None,
+                    help="comma-separated names in training index order "
+                         "(default: cfg.yolox_class_names)")
     ap.add_argument("--no-fuse", action="store_true")
     ap.add_argument("--out", type=Path, default=PROJECT_ROOT / "demo_runs" / "smoke_yolox")
     args = ap.parse_args()
@@ -41,7 +47,8 @@ def main() -> int:
     from pipeline.stage2_detect import get_detector, render
     from quality_check import load_image_bgr
 
-    names = tuple(n.strip() for n in args.classes.split(",") if n.strip())
+    names = (tuple(n.strip() for n in args.classes.split(",") if n.strip())
+             if args.classes else default_config().yolox_class_names)
     cfg = default_config(
         use_model=True, yolox_checkpoint=str(args.ckpt), yolox_class_names=names,
         yolox_input_size=(args.height, args.width), conf_thresh=args.conf,
@@ -57,7 +64,9 @@ def main() -> int:
         print(f"\nFAILED to load the detector:\n{exc}")
         return 1
     print(f"backend    : {detector.name}")
-    print(f"classes    : {list(names)}   (index order matters)")
+    print(f"classes    : {list(names)}"
+          f"   ({'from --classes' if args.classes else 'from config'}; "
+          f"index order matters)")
     print(f"input size : {args.height}x{args.width}  (height x width)")
     print(f"conf / nms : {args.conf} / {args.nms}")
     print(f"loaded in  : {time.time() - t0:.1f}s\n")

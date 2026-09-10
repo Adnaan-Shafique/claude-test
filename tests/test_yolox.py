@@ -160,6 +160,42 @@ block = build_detection_block([warning])
 check("the real name reaches the model prompt verbatim",
       "Warning sign (HV / RF radiation)" in block, block)
 
+print("\nno tool hardcodes class names over the config")
+# A stale literal in a --classes default silently overrides cfg.yolox_class_names
+# and reports wrong labels while the config is right. That happened once; this
+# stops it recurring. Question IDs (--question hazard_warning) are a different
+# thing and are deliberately not flagged.
+import re as _re  # noqa: E402
+
+offenders = []
+for path in sorted((ROOT / "tools").glob("*.py")) + [ROOT / "app" / "demo_dash_yolox.py"]:
+    text = path.read_text()
+    for match in _re.finditer(r'add_argument\(\s*["\']--classes["\'][^)]*?\)', text,
+                              _re.S):
+        block = match.group(0)
+        default = _re.search(r'default\s*=\s*(["\'][^"\']*["\']|None)', block)
+        if default and default.group(1) != "None":
+            line = text[:match.start()].count("\n") + 1
+            offenders.append(f"{path.name}:{line}: --classes default={default.group(1)}")
+check("no --classes default overrides the config", not offenders,
+      "\n         ".join(offenders))
+
+smoke = (ROOT / "tools" / "smoke_yolox.py").read_text()
+check("smoke_yolox falls back to cfg.yolox_class_names",
+      "default_config().yolox_class_names" in smoke)
+
+# The class names live in exactly one place. Anything else defining that tuple
+# is a second source of truth waiting to drift.
+cfg_src = (ROOT / "app" / "pipeline" / "config.py").read_text()
+check("config.py is where the names are defined",
+      "GPS Antenna" in cfg_src and "Warning sign" in cfg_src)
+for path in sorted((ROOT / "app" / "pipeline").glob("*.py")):
+    if path.name in ("config.py", "questions.py"):
+        continue   # questions.py legitimately names them for relevance matching
+    body = path.read_text()
+    check(f"{path.name} does not redefine the class names",
+          "GPS Antenna" not in body, path.name)
+
 print("\nboth backends produce the same downstream shape")
 from pipeline.schemas import Detection, DetectionStageResult, SOURCE_MODEL  # noqa: E402
 model_det = Detection.from_model_dict(
