@@ -197,6 +197,15 @@ class PipelineConfig:
                 return images_dir
         return self.annotation_dir
 
+    def resolve_yolox_checkpoint(self):
+        """The checkpoint to load. An explicit yolox_checkpoint wins; otherwise
+        <models_dir>/best_ckpt.pth, which is where SETUP tells you to scp it.
+        Returns None when neither exists, so the caller can say so plainly."""
+        if self.yolox_checkpoint:
+            return Path(self.yolox_checkpoint)
+        candidate = self.models_dir / "best_ckpt.pth"
+        return candidate if candidate.exists() else None
+
     def segmentation_model_path(self) -> Path:
         return self.models_dir / f"{self.segmentation_model}.onnx"
 
@@ -212,10 +221,13 @@ class PipelineConfig:
                 f"the segmenter would try to download it on first use, which must not happen on stage"
             )
         if self.use_model:
-            if not self.yolox_checkpoint:
-                problems.append("use_model=True but no yolox_checkpoint is set")
-            elif not Path(self.yolox_checkpoint).exists():
-                problems.append(f"yolox_checkpoint not found: {self.yolox_checkpoint}")
+            checkpoint = self.resolve_yolox_checkpoint()
+            if checkpoint is None:
+                problems.append(
+                    f"use_model=True but no checkpoint found - set yolox_checkpoint, "
+                    f"or place best_ckpt.pth at {self.models_dir / 'best_ckpt.pth'}")
+            elif not checkpoint.exists():
+                problems.append(f"yolox_checkpoint not found: {checkpoint}")
             if len(self.yolox_class_names) < 1:
                 problems.append("yolox_class_names is empty - the head's class count "
                                 "must match, and the names are what the UI and the "

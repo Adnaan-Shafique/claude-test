@@ -318,9 +318,10 @@ class YoloxDetector:
         self.cfg = cfg
         self.question = question
         self.class_names = list(cfg.yolox_class_names)
-        if not cfg.yolox_checkpoint:
+        if cfg.resolve_yolox_checkpoint() is None:
             raise ValueError(
-                "use_model=True needs cfg.yolox_checkpoint pointing at best_ckpt.pth.")
+                f"use_model=True needs a checkpoint: set cfg.yolox_checkpoint, or "
+                f"place best_ckpt.pth at {cfg.models_dir / 'best_ckpt.pth'}.")
         # Cached across runs - see yolox_runtime.get_predictor.
         self.predictor = get_predictor(cfg)
         self.name = self.predictor.describe()

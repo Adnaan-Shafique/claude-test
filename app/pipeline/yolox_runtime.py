@@ -221,13 +221,18 @@ _CACHE: dict = {}
 
 
 def get_predictor(cfg) -> "YoloxPredictor":
-    key = (str(cfg.yolox_checkpoint), tuple(cfg.yolox_class_names),
+    checkpoint = cfg.resolve_yolox_checkpoint()
+    if checkpoint is None:
+        raise FileNotFoundError(
+            f"No YOLOX checkpoint. Set cfg.yolox_checkpoint, or place best_ckpt.pth "
+            f"at {cfg.models_dir / 'best_ckpt.pth'}.")
+    key = (str(checkpoint), tuple(cfg.yolox_class_names),
            tuple(cfg.yolox_input_size), cfg.yolox_depth, cfg.yolox_width,
            cfg.yolox_act, float(cfg.conf_thresh), float(cfg.yolox_nms_threshold),
            bool(cfg.yolox_fuse))
     if key not in _CACHE:
         _CACHE[key] = YoloxPredictor(
-            cfg.yolox_checkpoint, list(cfg.yolox_class_names),
+            checkpoint, list(cfg.yolox_class_names),
             input_size=cfg.yolox_input_size, depth=cfg.yolox_depth,
             width=cfg.yolox_width, act=cfg.yolox_act,
             conf_threshold=cfg.conf_thresh, nms_threshold=cfg.yolox_nms_threshold,

@@ -85,6 +85,7 @@ def controls():
             html.Div([
                 html.Label("YOLOX checkpoint", htmlFor="ckpt"),
                 dcc.Input(id="ckpt", type="text", debounce=True,
+                          value=str(cfg.models_dir / "best_ckpt.pth"),
                           placeholder="/path/to/best_ckpt.pth"),
                 html.Div("YOLOX-S, depth 0.33 / width 0.50, as trained.",
                          className="field-help"),

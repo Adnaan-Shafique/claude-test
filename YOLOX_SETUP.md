@@ -19,8 +19,14 @@ Different ports on purpose — run both, show either.
 come from a working checkout:
 
 ```bash
-cp -r <field-ops>/src/YOLOX/yolox/models app/vendor/yolox/models
+rm -rf app/vendor/yolox/models   # scp nests if the target already exists
+scp -r admin@10.66.98.137:/data01/sds_field/Field_Ops/src/YOLOX/yolox/models \
+    app/vendor/yolox/models
+rm -rf app/vendor/yolox/models/__pycache__
 ```
+
+The source and the checkpoint live on AISERVER (10.66.98.137); the demo runs on
+FALCONPRD. See `COPY_FROM_AISERVER.md` for both copies in one place.
 
 Expect: `__init__.py`, `build.py`, `darknet.py`, `losses.py`,
 `network_blocks.py`, `yolo_fpn.py`, `yolo_head.py`, `yolo_pafpn.py`,
