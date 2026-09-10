@@ -51,7 +51,17 @@ source venv_yolox/bin/activate
 
 pip install --upgrade pip setuptools wheel
 pip install -r requirements-demo.txt          # known to resolve here: demo_venv used it
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# The proxy intercepts TLS. pypi.org is already exempted in this host's pip
+# config, but download.pytorch.org is not, so it fails cert verification with
+# "unable to get local issuer certificate". Extend the same exemption:
+pip install torch torchvision \
+  --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple \
+  --proxy http://10.94.147.19:8080 \
+  --trusted-host download.pytorch.org \
+  --trusted-host pypi.org \
+  --trusted-host files.pythonhosted.org
+
 pip install loguru psutil
 
 # Does the vendored package import?
@@ -81,3 +91,38 @@ The `scp -r` brings AISERVER's compiled `.pyc` files along. Both hosts run
 Python 3.12 so they would be ignored rather than mis-loaded, but they are
 removed above anyway — stale bytecode is never worth debugging under time
 pressure.
+
+---
+
+## If the torch install fails on TLS
+
+```
+SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED]
+certificate verify failed: unable to get local issuer certificate'))
+```
+
+The proxy re-signs HTTPS with a corporate CA. `pypi.org` and
+`files.pythonhosted.org` are already exempted on this host (which is why
+`requirements-demo.txt` installs cleanly); `download.pytorch.org` is not.
+
+Check what is configured before working around it:
+
+```bash
+pip config list
+```
+
+- A `cert = /path/...` line means a corporate CA bundle is available. Use
+  `--cert /path/...`, which verifies properly rather than skipping.
+- Otherwise add `--trusted-host download.pytorch.org`, as above — the same
+  exemption PyPI already has here.
+
+**Fallback:** torch is on PyPI too, over the path that already works:
+
+```bash
+pip install torch torchvision --proxy http://10.94.147.19:8080
+```
+
+PyPI's Linux `torch` is the CUDA build, so this pulls ~3-4GB of `nvidia-*`
+wheels that a CPU-only host never uses. It runs correctly -
+`torch.cuda.is_available()` simply returns False - so this costs download time
+and disk, not function.
