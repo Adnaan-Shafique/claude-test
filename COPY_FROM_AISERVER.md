@@ -56,11 +56,8 @@ pip install -r requirements-demo.txt          # known to resolve here: demo_venv
 # "unable to get local issuer certificate". Extend the same exemption:
 pip install torch torchvision \
   --index-url https://download.pytorch.org/whl/cpu \
-  --extra-index-url https://pypi.org/simple \
   --proxy http://10.94.147.19:8080 \
-  --trusted-host download.pytorch.org \
-  --trusted-host pypi.org \
-  --trusted-host files.pythonhosted.org
+  --trusted-host download.pytorch.org
 
 pip install loguru psutil
 
@@ -115,6 +112,13 @@ pip config list
   `--cert /path/...`, which verifies properly rather than skipping.
 - Otherwise add `--trusted-host download.pytorch.org`, as above — the same
   exemption PyPI already has here.
+
+**Do NOT add `--extra-index-url https://pypi.org/simple` here.** pip merges the
+two indexes and picks the highest version, which is PyPI's - and PyPI's Linux
+`torch` is the CUDA build. The CPU `--index-url` is then silently ignored and
+~2.5GB of unused `nvidia-*` and `triton` wheels come down with it. (It still
+works: `torch.cuda.is_available()` returns False and everything runs on CPU.
+It is disk and download time, not function.)
 
 **Fallback:** torch is on PyPI too, over the path that already works:
 
