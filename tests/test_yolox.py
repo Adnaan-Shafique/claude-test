@@ -28,11 +28,14 @@ def check(name, cond, detail=""):
 from pipeline.config import default_config                    # noqa: E402
 from pipeline import yolox_runtime as yr                      # noqa: E402
 
-print("\ndefaults pinned to the training run's own exp table")
+print("\ndefaults pinned to the training run's own exp table and classes.json")
 cfg = default_config()
 check("num classes = 2", len(cfg.yolox_class_names) == 2, str(cfg.yolox_class_names))
-check("index 0 is hazard_sign", cfg.yolox_class_names[0] == "hazard_sign")
-check("index 1 is gps_antenna", cfg.yolox_class_names[1] == "gps_antenna")
+# classes.json: {"names": ["GPS Antenna", "Warning sign (HV / RF radiation)"]}
+check("index 0 is GPS Antenna", cfg.yolox_class_names[0] == "GPS Antenna",
+      cfg.yolox_class_names[0])
+check("index 1 is the warning sign", cfg.yolox_class_names[1].startswith("Warning sign"),
+      cfg.yolox_class_names[1])
 check("depth 0.33 (yolox_s)", cfg.yolox_depth == 0.33)
 check("width 0.50 (yolox_s)", cfg.yolox_width == 0.50)
 check("input size is 640x480, NOT the stock 640x640",
@@ -112,6 +115,50 @@ except (ValueError, ImportError, FileNotFoundError) as exc:
     check("use_model=True with no checkpoint raises", True)
     check("the error names the setting", "yolox_checkpoint" in str(exc)
           or "models" in str(exc), str(exc)[:160])
+
+print("\nquestion matching survives the real label text")
+from pipeline.questions import _normalise, select_relevant  # noqa: E402
+from pipeline.schemas import Detection as _D                # noqa: E402
+hazard_q = get_question("hazard_warning")
+antenna_q = get_question("gps_antenna")
+
+
+def det(label):
+    return _D(label=label, confidence=0.9, box=[0, 0, 10, 10], source="model")
+
+
+check("punctuation and case folded",
+      _normalise("Warning sign (HV / RF radiation)") == "warning sign hv rf radiation",
+      _normalise("Warning sign (HV / RF radiation)"))
+check("underscores folded too", _normalise("gps_antenna") == "gps antenna")
+
+warning = det("Warning sign (HV / RF radiation)")
+antenna = det("GPS Antenna")
+
+picked = select_relevant([warning, antenna], hazard_q)
+check("hazard question picks the warning sign",
+      [d.label for d in picked] == ["Warning sign (HV / RF radiation)"],
+      str([d.label for d in picked]))
+
+picked = select_relevant([warning, antenna], antenna_q)
+check("antenna question picks the GPS antenna",
+      [d.label for d in picked] == ["GPS Antenna"], str([d.label for d in picked]))
+
+# The annotation stub's snake_case names must keep working alongside.
+check("snake_case labels still match the hazard question",
+      [d.label for d in select_relevant([det("hazard_sign")], hazard_q)] == ["hazard_sign"])
+check("snake_case labels still match the antenna question",
+      [d.label for d in select_relevant([det("gps_antenna")], antenna_q)] == ["gps_antenna"])
+
+# And the tolerant fallback survives.
+unknown = [det("class_0")]
+check("an unrecognised label still falls back to ALL detections",
+      [d.label for d in select_relevant(unknown, hazard_q)] == ["class_0"])
+
+from pipeline.questions import build_detection_block  # noqa: E402
+block = build_detection_block([warning])
+check("the real name reaches the model prompt verbatim",
+      "Warning sign (HV / RF radiation)" in block, block)
 
 print("\nboth backends produce the same downstream shape")
 from pipeline.schemas import Detection, DetectionStageResult, SOURCE_MODEL  # noqa: E402

@@ -17,6 +17,7 @@ Pure stdlib - importable and testable with nothing installed.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
@@ -135,8 +136,9 @@ QUESTIONS: dict[str, Question] = {
         # The HV export labels its single class 0; default_class_names below
         # resolves that to "hazard_sign" without a classes.txt. select_relevant()
         # still degrades safely if a folder uses different names.
-        relevant_classes=["hazard_sign", "warning_sign", "hazard", "sign", "placard"],
-        default_class_names=["hazard_sign"],
+        relevant_classes=["Warning sign (HV / RF radiation)", "hazard_sign",
+                          "warning_sign", "hazard", "sign", "placard"],
+        default_class_names=["Warning sign (HV / RF radiation)"],
     ),
     "gps_antenna": Question(
         id="gps_antenna",
@@ -147,8 +149,8 @@ QUESTIONS: dict[str, Question] = {
             "YES = the antenna's upward view is clear.  "
             "NO = its view of the sky is blocked or partially blocked."
         ),
-        relevant_classes=["gps_antenna", "gps", "antenna"],
-        default_class_names=["gps_antenna"],
+        relevant_classes=["GPS Antenna", "gps_antenna", "gps", "antenna"],
+        default_class_names=["GPS Antenna"],
     ),
 }
 
@@ -165,21 +167,39 @@ def get_question(question_id: str) -> Question:
         ) from None
 
 
+def _normalise(label: str) -> str:
+    """Fold a class name to comparable words.
+
+    Real labels are written for humans, not for matching: the trained detector's
+    own classes.json says "GPS Antenna" and "Warning sign (HV / RF radiation)",
+    while annotation folders use "gps_antenna". Exact string equality would miss
+    every one of those, so punctuation, case and separators are flattened.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", (label or "").lower()).strip()
+
+
 def select_relevant(detections: Iterable, question: Question) -> list:
     """Detections worth surfacing for this question.
 
-    Deliberately TOLERANT: if none of the detector's labels match the question's
-    relevant_classes, return ALL detections rather than none. The real class
-    names are still unconfirmed (the sample annotation is a bare class_id 0 with
-    no classes.txt), and an unrecognised label silently emptying both the
-    detection block and the crop would look exactly like "the detector found
-    nothing" - the wrong story to tell on stage.
+    Matches on normalised substrings in either direction, so "GPS Antenna"
+    matches the gps_antenna question and "Warning sign (HV / RF radiation)"
+    matches hazard_warning via "warning sign".
+
+    Still deliberately TOLERANT: if nothing matches, return ALL detections
+    rather than none. A label this function does not recognise silently
+    emptying both the detection block and the crop would look exactly like
+    "the detector found nothing" - the wrong story to tell on stage.
     """
     dets = list(detections)
     if not dets:
         return []
-    wanted = {c.strip().lower() for c in question.relevant_classes if c.strip()}
-    matched = [d for d in dets if str(getattr(d, "label", "")).strip().lower() in wanted]
+    wanted = [_normalise(c) for c in question.relevant_classes if c and c.strip()]
+    wanted = [w for w in wanted if w]
+    matched = []
+    for d in dets:
+        label = _normalise(str(getattr(d, "label", "")))
+        if label and any(w in label or label in w for w in wanted):
+            matched.append(d)
     return matched or dets
 
 

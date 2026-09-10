@@ -174,7 +174,10 @@ from pipeline.stage2_detect import get_detector as _gd      # noqa: E402
 det = _gd(default_config(annotation_dir=tree), question=_gq("hazard_warning"))
 r = det.detect(FakeImage(1000, 1000), "p1", image_path=tree / "hv" / "p1.jpg")
 check("sidecar found from the image's own folder", len(r.detections) == 1, r.note)
-check("sidecar label resolved via the question", r.detections[0].label == "hazard_sign",
+# The question's defaults now carry the annotators' real names, taken from the
+# run's classes.json rather than invented slugs.
+check("sidecar label resolved via the question",
+      r.detections[0].label == "Warning sign (HV / RF radiation)",
       r.detections[0].label)
 
 r = det.detect(FakeImage(1000, 1000), "p1")
@@ -219,13 +222,14 @@ antenna_q = get_question("gps_antenna")
 
 d_hv = get_detector(default_config(annotation_dir=hv), question=hazard_q)
 r_hv = d_hv.detect(FakeImage(1000, 1000), "hv_photo")
-check("class 0 reads as hazard_sign under the hazard question",
-      r_hv.detections[0].label == "hazard_sign", r_hv.detections[0].label)
+check("class 0 reads as the warning sign under the hazard question",
+      r_hv.detections[0].label == "Warning sign (HV / RF radiation)",
+      r_hv.detections[0].label)
 
 d_gps = get_detector(default_config(annotation_dir=gps), question=antenna_q)
 r_gps = d_gps.detect(FakeImage(1000, 1000), "gps_photo")
-check("the SAME class id 0 reads as gps_antenna under the antenna question",
-      r_gps.detections[0].label == "gps_antenna", r_gps.detections[0].label)
+check("the SAME class id 0 reads as GPS Antenna under the antenna question",
+      r_gps.detections[0].label == "GPS Antenna", r_gps.detections[0].label)
 
 check("the note says the names came from the question, not the data",
       "question" in r_hv.note, r_hv.note)

@@ -96,7 +96,7 @@ Every default is read off the training run's own logged exp table
 | Setting | Value | Source |
 |---|---|---|
 | `num_classes` | 2 | exp table |
-| classes | `hazard_sign`, `gps_antenna` | index order confirmed by you |
+| classes | `GPS Antenna` (0), `Warning sign (HV / RF radiation)` (1) | the run's own `classes.json` |
 | `depth` | 0.33 | exp table (yolox_s) |
 | `width` | 0.50 | exp table (yolox_s) |
 | `act` | silu | exp table |
@@ -119,11 +119,24 @@ under Options for exactly this reason.
 
 ### Class order
 
-YOLOX stores no class names in a checkpoint. `hazard_sign` is index 0 and
-`gps_antenna` index 1, per your confirmation. Swapping them would not error —
-it would put a confident wrong label on screen *and* into the model prompt as
-evidence. The field is editable in the Detector card so it can be corrected
-live.
+YOLOX stores no class names in a checkpoint, so they come from the run's own
+`classes.json`:
+
+```json
+{"nc": 2, "names": ["GPS Antenna", "Warning sign (HV / RF radiation)"]}
+```
+
+**Index 0 is GPS Antenna**, index 1 the warning sign — the reverse of the order
+originally assumed. The first smoke run caught it: the detector was localising
+hazard signs correctly, at 0.89–0.94 confidence, and calling them
+`gps_antenna`. Swapping the order does not error; it puts a confident wrong
+label on screen *and* into the model prompt as evidence. That is why the order
+is read from `classes.json` rather than inferred from output, and why the field
+stays editable in the Detector card.
+
+The names are the annotators' own, kept verbatim rather than slugified. Question
+matching normalises punctuation and case, so `GPS Antenna`, `gps_antenna` and
+`Warning sign (HV / RF radiation)` all resolve to the right question.
 
 ## What is NOT vendored, and why
 

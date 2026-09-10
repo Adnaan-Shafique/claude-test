@@ -60,8 +60,12 @@ def draw_detections(image_bgr, detections: Iterable, thickness: int | None = Non
         cap_y = y1 - baseline - 2
         if cap_y - th < 0:
             cap_y = y1 + th + baseline + 2
-        cv2.rectangle(out, (x1, cap_y - th - baseline), (x1 + tw + 4, cap_y + baseline),
-                      colour, -1)
-        cv2.putText(out, caption, (x1 + 2, cap_y), font, font_scale, (255, 255, 255),
+        # The real class names are long ("Warning sign (HV / RF radiation)"), so
+        # a box near the right edge would push its caption off the frame. Shift
+        # it left instead of letting it disappear.
+        cap_x = min(x1, max(0, w - tw - 6))
+        cv2.rectangle(out, (cap_x, cap_y - th - baseline),
+                      (cap_x + tw + 4, cap_y + baseline), colour, -1)
+        cv2.putText(out, caption, (cap_x + 2, cap_y), font, font_scale, (255, 255, 255),
                     max(1, t // 2), cv2.LINE_AA)
     return out

@@ -80,8 +80,16 @@ class PipelineConfig:
     yolox_input_size: tuple[int, int] = (640, 480)
     yolox_nms_threshold: float = 0.65            # yolox_base default
     yolox_fuse: bool = True
-    # Class names in TRAINING INDEX ORDER. YOLOX stores none in the checkpoint.
-    yolox_class_names: tuple[str, ...] = ("hazard_sign", "gps_antenna")
+    # Class names in TRAINING INDEX ORDER, verbatim from the run's own
+    # classes.json (models/yolox/runs/<run>/classes.json, written by
+    # 02_train.ipynb from configs/dataset.yaml):
+    #     {"nc": 2, "names": ["GPS Antenna", "Warning sign (HV / RF radiation)"]}
+    # YOLOX stores no names in a checkpoint, so this is the only record of them.
+    # The order is the REVERSE of what was assumed before the smoke test: the
+    # detector was localising hazard signs correctly and calling them
+    # gps_antenna. Read from the data, never inferred from output.
+    yolox_class_names: tuple[str, ...] = (
+        "GPS Antenna", "Warning sign (HV / RF radiation)")
 
     # ── Stage 3: VLM ─────────────────────────────────────────────────────────
     gpu_url: str = DEFAULT_GPU_URL
