@@ -34,3 +34,14 @@ gradio>=4.44,<6
 # only_mask=True. If the resolve fights you, see SETUP.md for the slim path.
 rembg>=2.0.57
 onnxruntime>=1.17
+
+# ── Trained detector (app/demo_dash_yolox.py only) ───────────────────────────
+# Not needed by the annotation-file version. CPU wheels are the right choice
+# here: a YOLOX-S forward pass takes well under the ~2s the quality stage
+# already costs, so the GPU build's size and driver-matching are not worth it.
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# torch>=2.2
+# torchvision>=0.17
+# Vendored yolox/utils imports these at module scope:
+# loguru>=0.7
+# psutil>=5.9

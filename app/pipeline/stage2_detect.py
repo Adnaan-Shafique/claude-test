@@ -298,65 +298,69 @@ class AnnotationFileDetector:
         return result
 
 
-class ModelDetector:
-    """Wraps the real detector. Zero changes to the detection logic itself.
+class YoloxDetector:
+    """The trained YOLOX-S detector.
 
-    Every heavy import happens inside __init__/detect, never at module scope -
-    inference.py imports torch and injects YOLOX paths on import, and
-    model_registry.py imports eval_utils, none of which should run in stub mode.
+    Returns the identical DetectionStageResult shape the annotation stub does,
+    so nothing downstream changes - only is_stub and model_name differ, and
+    those exist so the UI can say which produced the boxes.
+
+    Loaded once and reused: a YOLOX-S forward pass is cheap, but building the
+    network and reading 60MB of weights is not, and doing it per image would
+    dominate the run.
     """
 
     is_stub = False
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, question=None):
+        from .yolox_runtime import get_predictor
+
         self.cfg = cfg
-        try:
-            import model_registry  # noqa: F401  (heavy: eval_utils)
-            import inference       # noqa: F401  (heavy: torch, YOLOX sys.path)
-        except ImportError as exc:
-            raise ImportError(
-                "use_model=True needs inference.py and model_registry.py on the path, "
-                "plus torch, YOLOX and a trained checkpoint. None of that ships with "
-                "the demo pipeline - leave cfg.use_model=False to use the annotation "
-                f"stub. Original error: {exc}"
-            ) from exc
-        self._inference = inference
-        entries = model_registry.get_available_models()
-        if not entries:
-            raise RuntimeError(
-                "use_model=True but model_registry.get_available_models() found no "
-                "checkpoints under models/yolox/runs or models/yolo/runs."
-            )
-        self.entry = entries[0]
-        self.name = f"{self.entry['model']} ({self.entry['framework']})"
+        self.question = question
+        self.class_names = list(cfg.yolox_class_names)
+        if not cfg.yolox_checkpoint:
+            raise ValueError(
+                "use_model=True needs cfg.yolox_checkpoint pointing at best_ckpt.pth.")
+        # Cached across runs - see yolox_runtime.get_predictor.
+        self.predictor = get_predictor(cfg)
+        self.name = self.predictor.describe()
+        self.class_names_source = "the checkpoint's training class order"
 
     def detect(self, image_bgr, stem: str, dest_path=None,
                image_path=None) -> DetectionStageResult:
         # image_path is accepted for signature parity with the stub; a real
         # model reads the array, never a sidecar file.
-        annotated_bgr, raw = self._inference.run_inference(
-            self.entry, image_bgr, conf_thresh=self.cfg.conf_thresh)
+        raw = self.predictor.detect(image_bgr)
         detections = [Detection.from_model_dict(d, source=SOURCE_MODEL) for d in raw]
+        note = ""
+        if not detections:
+            note = (f"no detection above the {self.cfg.conf_thresh:.2f} confidence "
+                    f"threshold")
         result = DetectionStageResult(
             detections=detections, annotated_path=None, model_name=self.name,
-            is_stub=False, note="",
+            is_stub=False, note=note,
         )
-        if dest_path is not None:
-            # The real backend already returns a plotted image; write that
-            # rather than re-drawing, so its own visual conventions survive.
-            _write(annotated_bgr, dest_path, result)
+        if dest_path is not None and detections:
+            render(image_bgr, result, dest_path)
         return result
 
 
 def get_detector(cfg, question=None, annotation_dir=None):
-    """The one switch. cfg.use_model=False (the default) gives the stub.
+    """The one switch.
+
+    cfg.use_model=True  -> the trained YOLOX-S checkpoint
+    cfg.use_model=False -> the annotation-file stub (the default)
+
+    Both return the same DetectionStageResult, so the orchestrator, the cards
+    and the VLM prompt are identical either way.
 
     `question` lets the stub resolve class ids the way that question's own
     annotation export numbered them, and selects a per-question label folder
-    when cfg.annotation_dirs has one.
+    when cfg.annotation_dirs has one. The YOLOX backend does not need it - the
+    checkpoint carries its own class order.
     """
     if cfg.use_model:
-        return ModelDetector(cfg)
+        return YoloxDetector(cfg, question=question)
     return AnnotationFileDetector(cfg, question=question, annotation_dir=annotation_dir)
 
 

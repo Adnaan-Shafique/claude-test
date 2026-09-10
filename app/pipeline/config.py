@@ -63,6 +63,26 @@ class PipelineConfig:
     # number, so this is a seeded hash of "<stem>:<index>", never random().
     stub_conf_range: tuple[float, float] = (0.88, 0.97)
 
+    # ── Stage 2b: the trained YOLOX detector (use_model=True) ────────────────
+    # Every value read off the training run's own logged exp table
+    # (02_train.ipynb cell 9), not assumed. See yolox_runtime.py.
+    yolox_checkpoint: Optional[str] = None       # path to best_ckpt.pth
+    yolox_depth: float = 0.33                    # yolox_s
+    yolox_width: float = 0.50                    # yolox_s
+    yolox_act: str = "silu"
+    # (height, width). NOT the stock 640x640: exps/field_ops/yolox_s_field_ops.py
+    # reads this from configs/resolution.yaml, which 01_data_prep.ipynb derives
+    # from the pool's median aspect ratio - portrait photos at ~0.75 give 640x480.
+    # Getting it wrong never errors. On a portrait photo the boxes still land
+    # correctly (height limits the scale either way) but the model sees extra
+    # padding and predicts differently; on a landscape photo the rescale ratio
+    # itself changes and every box is wrong by that factor.
+    yolox_input_size: tuple[int, int] = (640, 480)
+    yolox_nms_threshold: float = 0.65            # yolox_base default
+    yolox_fuse: bool = True
+    # Class names in TRAINING INDEX ORDER. YOLOX stores none in the checkpoint.
+    yolox_class_names: tuple[str, ...] = ("hazard_sign", "gps_antenna")
+
     # ── Stage 3: VLM ─────────────────────────────────────────────────────────
     gpu_url: str = DEFAULT_GPU_URL
     vlm_model: str = DEFAULT_VLM_MODEL
@@ -191,6 +211,15 @@ class PipelineConfig:
                 f"{self.segmentation_model}.onnx not found at {self.segmentation_model_path()} - "
                 f"the segmenter would try to download it on first use, which must not happen on stage"
             )
+        if self.use_model:
+            if not self.yolox_checkpoint:
+                problems.append("use_model=True but no yolox_checkpoint is set")
+            elif not Path(self.yolox_checkpoint).exists():
+                problems.append(f"yolox_checkpoint not found: {self.yolox_checkpoint}")
+            if len(self.yolox_class_names) < 1:
+                problems.append("yolox_class_names is empty - the head's class count "
+                                "must match, and the names are what the UI and the "
+                                "VLM prompt both show")
         if not self.use_model and not self.annotation_dir.exists():
             problems.append(
                 f"annotation_dir does not exist: {self.annotation_dir} - "
