@@ -1,0 +1,15 @@
+dash==2.18.1
+Flask==3.0.3
+psycopg2-binary==2.9.9
+bcrypt==4.2.0
+pyjwt==2.9.0
+requests==2.32.3
+
+# Only needed once a user rates an answer: ratings are stored as embeddings and
+# replayed as good/bad examples. Until then the model is never loaded.
+sentence-transformers==3.1.1
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+# Development only:
+#   pytest==8.3.3
