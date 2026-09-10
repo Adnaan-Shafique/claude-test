@@ -34,7 +34,8 @@ PORTS = {
     8050: "app.py (Sudh, Dash detection demo)",
     7860: "vlm_test_client_v2.py (Adnaan, VLM client)",
     7861: "review_ui.py (manual review)",
-    7870: "demo_app.py (NEW integrated demo UI)",
+    7870: "demo_dash.py (integrated demo UI, annotation detector)",
+    7871: "demo_dash_yolox.py (integrated demo UI, YOLOX detector)",
 }
 
 _failures: list[str] = []
@@ -256,16 +257,20 @@ def check_gpu(gpu_url: str) -> None:
         warn("qwen3-vl reports no max_images - the client-side cap will not apply")
 
 
-def check_ports() -> None:
+def check_ports(want: int = 7870) -> None:
+    """`want` is the port THIS run intends to bind. Every other port is
+    reported for information only: the two demo UIs are meant to run side by
+    side, so 7870 being busy while you are starting the YOLOX app on 7871 is
+    the normal case, not a failure."""
     section("Ports")
     for port, owner in sorted(PORTS.items()):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.4)
         in_use = s.connect_ex(("127.0.0.1", port)) == 0
         s.close()
-        if port == 7870:
+        if port == want:
             if in_use:
-                fail(f"{port} ({owner}) is already in use - the demo UI cannot bind")
+                fail(f"{port} ({owner}) is already in use - this UI cannot bind")
             else:
                 ok(f"{port} free for {owner}")
         else:
@@ -381,6 +386,10 @@ def main() -> int:
     ap.add_argument("--offline-check", action="store_true",
                     help="interactively verify u2netp loads with the network down")
     ap.add_argument("--skip-gpu", action="store_true")
+    ap.add_argument("--port", type=int, default=7870,
+                    help="the port this run intends to bind (7870 for demo_dash.py, "
+                         "7871 for demo_dash_yolox.py). Only that one is required "
+                         "free; the others are reported for information.")
     ap.add_argument("--labels", type=Path, default=None,
                     help="folder holding the <stem>.txt label files, if not data/labels "
                          "(commonly the photo folder itself)")
@@ -396,7 +405,7 @@ def main() -> int:
     check_annotations(args.labels)
     if not args.skip_gpu:
         check_gpu(args.gpu_url)
-    check_ports()
+    check_ports(args.port)
 
     section("Summary")
     if _failures:
