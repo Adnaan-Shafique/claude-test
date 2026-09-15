@@ -181,6 +181,21 @@ python3 analyze.py --results ./results --out ./report \
 delivers 4, the shortfall is the finding — not the utilization number sitting
 next to it.
 
+**It is a retirement rate, measured over the span the system was working** —
+successful responses ÷ (last response received − first request sent). It is
+deliberately not completions ÷ firing window. When service time approaches the
+window length, work queued during a burst retires afterwards, and charging those
+completions to the shorter window overstates throughput by an order of magnitude
+in exactly the saturated regime you care about. The span measure converges to
+the offered rate when the system keeps up, and to true service rate when it
+does not.
+
+**Watch the `Drain tail` column.** If a phase fired for 10s and then drained for
+60s, it never reached steady state — it measured a queue emptying. The report
+warns when this happens and tells you what `--burst-duration` to use instead
+(rule of thumb: at least 10× the mean service time). The default 60s is fine
+once `max_concurrent` is raised; at `max_concurrent: 2` you will need longer.
+
 **`nvidia-smi` utilization is time-occupancy, not work.** It reports the share
 of the sampling window in which at least one kernel was resident, not how much
 of the SM array was busy. One decoding sequence at batch size 1 can read 95%

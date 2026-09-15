@@ -169,10 +169,36 @@ def analyse_scenario(name: str, phase: dict, rows: list[dict], sla_p95: float) -
     n_timeout = by_status.get("timeout", 0)
     n_err     = by_status.get("error", 0) + by_status.get("http_error", 0)
 
-    # Every request counted here was FIRED during the offered window, so
-    # completions are divided by that window even when some of them landed
-    # during the drain. That is the throughput the offered load actually got.
-    achieved = n_ok / duration if duration > 0 else 0.0
+    # Throughput is the rate at which the system RETIRED work, measured over the
+    # span it was actually working — first request sent to last response
+    # received.
+    #
+    # Dividing completions by the firing window instead is wrong whenever
+    # service time approaches the window length, and wrong in the flattering
+    # direction: a 10 s burst against a 9 s service time queues work that
+    # retires over the following drain, so 16 completions ÷ 10 s claims
+    # 1.6 img/s for a system genuinely retiring 0.16 img/s. Under saturation —
+    # exactly where the capacity answer lives — that error is an order of
+    # magnitude.
+    #
+    # The span measure converges to the offered rate when the system keeps up
+    # (requests spread across the window, span ≈ window) and to true service
+    # rate when it does not, so one number is correct in both regimes.
+    if ok_rows:
+        first_send = min(fnum(r, "send_ts") for r in ok_rows)
+        last_recv  = max(fnum(r, "recv_ts") for r in ok_rows)
+        span       = max(last_recv - first_send, 1e-9)
+    else:
+        span = max(duration, 1e-9)
+    achieved = n_ok / span if n_ok else 0.0
+
+    # Kept as a diagnostic: completions that actually landed while load was
+    # still being offered. A large gap between this and `achieved` means the
+    # phase was still draining long after firing stopped — i.e. deeply
+    # saturated, and the burst was too short to reach steady state.
+    in_window = sum(1 for r in ok_rows if fnum(r, "recv_ts") <= fire_end)
+    delivered_in_window = in_window / duration if duration > 0 else 0.0
+    drain_tail_s = max(0.0, span - duration)
 
     lat   = describe([fnum(r, "latency_s")     for r in ok_rows])
     gpu_t = describe([fnum(r, "gpu_elapsed_s") for r in ok_rows])
@@ -209,7 +235,9 @@ def analyse_scenario(name: str, phase: dict, rows: list[dict], sla_p95: float) -
 
     return {
         "scenario": name, "target_rate": target, "duration_s": round(duration, 1),
-        "wall_s": round(wall, 1),
+        "wall_s": round(wall, 1), "span_s": round(span, 1),
+        "delivered_in_window_rate": round(delivered_in_window, 3),
+        "completed_in_window": in_window, "drain_tail_s": round(drain_tail_s, 1),
         "fired": fired, "ok": n_ok, "saturated": n_sat, "shed_client": n_shed,
         "timeout": n_timeout, "errors": n_err,
         "success_rate": round(success_rate, 4),
@@ -1077,12 +1105,13 @@ def build_report(ctx: dict, out: Path) -> str:
     w("")
     w(md_table(
         ["Scenario", "Offered", "Delivered", "% of offered", "Success",
-         "p50", "p95", "p99", "Peak in-flight", "Verdict"],
+         "p50", "p95", "p99", "Peak in-flight", "Drain tail", "Verdict"],
         [[
             f"`{s['scenario']}`", f"{s['target_rate']:g}/s", f"{s['achieved_rate']:.2f}/s",
             f"{s['rate_ratio'] * 100:.0f}%", f"{s['success_rate'] * 100:.1f}%",
             f"{s['latency_s']['p50']:.1f}s", f"{s['latency_s']['p95']:.1f}s",
             f"{s['latency_s']['p99']:.1f}s", s["peak_concurrency"],
+            f"{s['drain_tail_s']:.0f}s",
             f"{STATUS_ICON[s['verdict']]} **{s['verdict'].title()}**",
         ] for s in scenarios]))
     w("")
@@ -1090,6 +1119,29 @@ def build_report(ctx: dict, out: Path) -> str:
       "▲ Degraded: ≥80% of offered rate but breached SLA or lost requests · "
       "✖ Failed: could not keep pace.")
     w("")
+    w("**How 'delivered' is measured.** It is the rate at which the system *retired* "
+      "work — successful responses divided by the span from the first request sent to "
+      "the last response received. It is deliberately **not** completions divided by "
+      "the firing window: when service time approaches the window length, work queued "
+      "during the burst retires afterwards, and charging those completions to the "
+      "shorter window overstates throughput by an order of magnitude in exactly the "
+      "saturated regime where the capacity answer lives.")
+    w("")
+
+    short_bursts = [s_ for s_ in scenarios if s_["drain_tail_s"] > s_["duration_s"]]
+    if short_bursts:
+        w(f"> **⚠ {len(short_bursts)} scenario(s) were still draining long after firing "
+          f"stopped.** "
+          + "; ".join(f"`{s_['target_rate']:g}/s` fired for {s_['duration_s']:.0f}s then "
+                      f"drained for a further {s_['drain_tail_s']:.0f}s"
+                      for s_ in short_bursts)
+          + ". The burst was far shorter than the time needed to work through what it "
+            "queued, so these phases never reached steady state — they measure the "
+            "queue emptying, not a sustained rate. Re-run with `--burst-duration` set "
+            "to at least 10× the mean service time "
+            f"(≈ {scenarios[0]['gpu_time_s']['mean'] * 10:.0f}s here) before treating "
+            "any high-rate figure as a capacity result.")
+        w("")
     for s in scenarios:
         w(f"- **{s['target_rate']:g}/s** — {s['verdict_reason']}.")
     w("")
