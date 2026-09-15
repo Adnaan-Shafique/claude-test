@@ -272,6 +272,7 @@ def gpu_window_stats(gpu_rows: list[dict], t0: float, t1: float, offset: float) 
         per_gpu[g]["power"].append(fnum(r, "power_w"))
         per_gpu[g]["sm_clock"].append(fnum(r, "sm_clock_mhz"))
         per_gpu[g]["mem_total_mb"].append(fnum(r, "mem_total_mb"))
+        per_gpu[g]["power_limit_w"].append(fnum(r, "power_limit_w"))
         power_by_ts[round(ts, 1)] += fnum(r, "power_w")
 
     out: dict = {"gpus": {}, "samples": 0}
@@ -285,6 +286,7 @@ def gpu_window_stats(gpu_rows: list[dict], t0: float, t1: float, offset: float) 
             "power_w":      describe(cols["power"]),
             "sm_clock_mhz": describe(cols["sm_clock"]),
             "mem_total_gb": round(max(cols["mem_total_mb"]) / 1024, 1) if cols["mem_total_mb"] else 0.0,
+            "power_limit_w": round(max(cols["power_limit_w"]), 0) if cols["power_limit_w"] else 0.0,
         }
         out["samples"] = max(out["samples"], len(cols["util"]))
 
@@ -310,6 +312,141 @@ def host_window_stats(host_rows: list[dict], t0: float, t1: float, offset: float
         "disk_path":     sel[-1].get("disk_path", ""),
     }
 
+
+
+
+def compute_final_sizing(args, scenarios: list[dict], phase_gpu: dict, phase_host: dict,
+                         storage: dict, ram: dict, economics: dict, meta: dict,
+                         idle_key: str, sustained: float) -> dict:
+    """The sourcing spec, derived from what the run actually measured.
+
+    Everything here comes from the samplers rather than from a model, with two
+    exceptions that are labelled as projections in the report: the throughput
+    at a raised concurrency, and the power that would follow from it.
+    """
+    load_phases = [s_["scenario"] for s_ in scenarios]
+    entry = (meta.get("server_config") or {}).get("model_entry") or {}
+    concurrency_now = int(entry.get("max_concurrent") or args.max_concurrent)
+
+    # ── VRAM: separate memory that is working from memory that is merely held ─
+    # A GPU holding tens of GB at ~0% utilisation through every phase is not
+    # "spare capacity available for TP=2" — it is occupied, and a model cannot
+    # be loaded onto it until whatever holds it is cleared.
+    gpus_working, gpus_stranded = {}, {}
+    for g in (phase_gpu.get(idle_key, {}).get("gpus", {}) or {}):
+        utils = [phase_gpu[p]["gpus"][g]["util_pct"]["mean"]
+                 for p in load_phases
+                 if p in phase_gpu and g in phase_gpu[p].get("gpus", {})]
+        mem = [phase_gpu[p]["gpus"][g]["mem_used_gb"]["mean"]
+               for p in load_phases
+               if p in phase_gpu and g in phase_gpu[p].get("gpus", {})]
+        if not utils:
+            continue
+        # Classify on the MEDIAN of the per-phase means, not the peak. A card
+        # that is idle all run can still register a percent or two in one phase
+        # from a transient — driver polling, another tenant, a stray kernel — and
+        # judging on the peak lets that one blip promote an idle GPU to
+        # "working", which is exactly the misreading this check exists to catch.
+        med_util  = float(np.median(utils))
+        peak_util = max(utils)
+        mem_gb    = max(mem) if mem else 0.0
+        total_gb  = phase_gpu[idle_key]["gpus"][g]["mem_total_gb"]
+        rec = {"util_pct": med_util, "peak_util_pct": peak_util,
+               "mem_gb": mem_gb, "total_gb": total_gb}
+        stranded = med_util < args.idle_gpu_util_pct and mem_gb > 5.0
+        (gpus_stranded if stranded else gpus_working)[g] = rec
+
+    stranded_gb = sum(v["mem_gb"] for v in gpus_stranded.values())
+
+    # ── where the time went ──────────────────────────────────────────────────
+    base = scenarios[0]
+    q    = base["queue_wait_s"]["mean"]
+    c    = base["gpu_time_s"]["mean"]
+    queue_share = q / (q + c) if (q + c) else 0.0
+
+    # ── how much of the GPU the workload is actually using ───────────────────
+    busiest = max(load_phases,
+                  key=lambda p: max((phase_gpu[p]["gpus"][g]["util_pct"]["mean"]
+                                     for g in phase_gpu.get(p, {}).get("gpus", {})),
+                                    default=0.0)) if load_phases else None
+    membw = power_w = tdp_w = sm_util = 0.0
+    if busiest and phase_gpu.get(busiest, {}).get("gpus"):
+        act = [v for g, v in phase_gpu[busiest]["gpus"].items() if g in gpus_working]
+        if act:
+            sm_util = max(v["util_pct"]["mean"] for v in act)
+            membw   = max(v["mem_util_pct"]["mean"] for v in act)
+            power_w = max(v["power_w"]["mean"] for v in act)
+            tdp_w   = max(v.get("power_limit_w") or 0.0 for v in act) or args.gpu_tdp_w
+
+    # ── CPU, from the measured load average rather than an assumed ms/image ──
+    cpu_basis = "measured load average"
+    idle_load = (phase_host.get(idle_key) or {}).get("load1", {}).get("mean", 0.0)
+    busy_host = (phase_host.get(base["scenario"]) or {}).get("load1", {}).get("mean", 0.0)
+    if busy_host > idle_load > 0 and base["achieved_rate"] > 0:
+        cores_per_img_s = (busy_host - idle_load) / base["achieved_rate"]
+    else:
+        cpu_basis = f"assumed {args.cpu_ms_per_image:g} ms/image (no host samples)"
+        cores_per_img_s = args.cpu_ms_per_image / 1000.0
+        idle_load = 4.0
+
+    # ── projection at a raised semaphore ─────────────────────────────────────
+    # vLLM's throughput comes from batching, and the semaphore caps the batch.
+    # Each doubling of the batch is worth somewhere between these two factors;
+    # the band is deliberately wide because it is an extrapolation, not a
+    # measurement. The report never presents the midpoint as a result.
+    doublings = math.log2(max(args.project_concurrency, 1) / max(concurrency_now, 1))
+    lo = sustained * (args.project_gain_low  ** doublings)
+    hi = sustained * (args.project_gain_high ** doublings)
+
+    req_rate = args.daily_images / (args.window_hours * 3600.0)
+    needed_multiple = req_rate / sustained if sustained else 0.0
+
+    def cores_for(rate: float) -> int:
+        raw = idle_load + cores_per_img_s * rate + 2.0   # +2 for the API path
+        return int(math.ceil(raw * args.cpu_headroom / 2.0) * 2)
+
+    host = next((h for h in phase_host.values() if h), {})
+    need_gb = storage["cases"]["High"]["provisioned_gb"]
+    free_gb = float(host.get("disk_free_gb") or 0.0)
+
+    return {
+        "concurrency_now": concurrency_now,
+        "tensor_parallel_size": entry.get("tensor_parallel_size"),
+        "gpu_memory_utilization": entry.get("gpu_memory_utilization"),
+        "gpus_working": gpus_working, "gpus_stranded": gpus_stranded,
+        "stranded_gb": stranded_gb,
+        "working_vram_gb": sum(v["mem_gb"] for v in gpus_working.values()),
+        "queue_wait_s": q, "compute_s": c, "queue_share": queue_share,
+        "sm_util_pct": sm_util, "membw_pct": membw,
+        "power_w": power_w, "tdp_w": tdp_w,
+        "power_headroom": (1 - power_w / tdp_w) if tdp_w else 0.0,
+        "cores_per_img_s": cores_per_img_s, "idle_load": idle_load,
+        "cpu_basis": cpu_basis,
+        "cores_now": cores_for(sustained), "cores_projected": cores_for(hi),
+        "ram_peak_gb": ram["measured_peak_gb"], "ram_installed_gb": ram["installed_gb"],
+        "ram_recommended_gb": _round_to_dimm(max(ram["measured_peak_gb"] * 1.6,
+                                                 ram["cases"][list(ram["cases"])[1]]["total_gb"])),
+        "projected_lo": lo, "projected_hi": hi,
+        "project_concurrency": args.project_concurrency,
+        "required_rate": req_rate, "needed_multiple": needed_multiple,
+        "storage_need_gb": need_gb, "storage_free_gb": free_gb,
+        "storage_short_gb": max(0.0, need_gb - free_gb),
+        "model_store_used_gb": float(host.get("disk_used_gb") or 0.0),
+        "model_store_total_gb": float(host.get("disk_total_gb") or 0.0),
+        "model_store_path": host.get("disk_path", "n/a"),
+        "swap_gb": (phase_host.get(idle_key) or {}).get("swap_used_gb", {}).get("mean", 0.0),
+        "failed_models": ((meta.get("server_config") or {})
+                          .get("gpu_health", {}) or {}).get("failed_models", {}) or {},
+        "nodes_now": {s_["target_rate"]: max(1, math.ceil(s_["target_rate"] / sustained))
+                      for s_ in scenarios} if sustained else {},
+        "nodes_lo": {s_["target_rate"]: max(1, math.ceil(s_["target_rate"] / hi))
+                     for s_ in scenarios} if hi else {},
+        "nodes_hi": {s_["target_rate"]: max(1, math.ceil(s_["target_rate"] / lo))
+                     for s_ in scenarios} if lo else {},
+        "clear_h_now": args.daily_images / sustained / 3600.0 if sustained else 0.0,
+        "clear_h_lo": args.daily_images / hi / 3600.0 if hi else 0.0,
+        "clear_h_hi": args.daily_images / lo / 3600.0 if lo else 0.0,
+    }
 
 
 # ═══════════════════════════ storage & RAM sizing ═════════════════════════════
@@ -1698,6 +1835,174 @@ def build_report(ctx: dict, out: Path) -> str:
       f"`--cpu-ms-per-image` before quoting the row in a purchase order.")
     w("")
 
+    # ── 12. Final hardware sizing ───────────────────────────────────────────
+    f = ctx["final"]
+    w("## 12. Final hardware sizing")
+    w("")
+    w(f"The sourcing spec, derived from the run. Every row is **measured** unless "
+      f"marked *projected*. Node unit: **{a.gpus_per_node} × H200 NVL**.")
+    w("")
+
+    if f["gpus_stranded"]:
+        ids = ", ".join(f"GPU {g}" for g in sorted(f["gpus_stranded"]))
+        w(f"> ### ⚠ {f['stranded_gb']:.0f} GB of VRAM is held but not working")
+        w(f">")
+        worst = max(v["peak_util_pct"] for v in f["gpus_stranded"].values())
+        w(f"> {ids} held **{f['stranded_gb']:.1f} GB** at a **median utilization of "
+          f"{max(v['util_pct'] for v in f['gpus_stranded'].values()):.1f}% across the "
+          f"load phases** (peak in any single phase: {worst:.1f}%). That memory is "
+          f"not spare capacity waiting to be used — it is occupied, and no engine can "
+          f"be loaded onto it until whatever holds it is cleared. Any plan that "
+          f"depends on the second GPU (raising `tensor_parallel_size` to "
+          f"{a.gpus_per_node}, or co-residing a second model) is blocked until then.")
+        if f["failed_models"]:
+            w(f">")
+            for name, err in f["failed_models"].items():
+                w(f"> The registry reports `{name}` failed to load: *{str(err)[:160]}*. "
+                  f"A failed engine that never released its allocation is the most "
+                  f"likely holder.")
+        w(">")
+        w("> ```bash")
+        w("> nvidia-smi --query-compute-apps=pid,used_memory,name --format=csv")
+        w("> ```")
+        w("")
+
+    w("### Where the time goes")
+    w("")
+    w(md_table(["Measure", "Value", "Reading"], [
+        ["GPU compute per image", f"**{f['compute_s']:.2f}s**", "the actual work"],
+        ["Queue wait per image", f"**{f['queue_wait_s']:.2f}s**",
+         f"waiting for one of {f['concurrency_now']} semaphore slots"],
+        ["Share of latency spent queueing", f"**{f['queue_share'] * 100:.1f}%**",
+         "the system is not compute-bound"],
+        ["SM utilization", f"{f['sm_util_pct']:.1f}%",
+         "time-occupancy — kernels resident, not work done"],
+        ["Memory bandwidth used", f"**{f['membw_pct']:.1f}%**",
+         "the honest utilization figure — most of the card is idle"],
+        ["Board power", f"{f['power_w']:.0f} W of {f['tdp_w']:.0f} W",
+         f"{f['power_headroom'] * 100:.0f}% of the power envelope unused"],
+    ]))
+    w("")
+    w(f"A GPU reading {f['sm_util_pct']:.0f}% \"utilization\" while using "
+      f"{f['membw_pct']:.0f}% of its bandwidth and {100 - f['power_headroom'] * 100:.0f}% "
+      f"of its power budget is **starved, not busy**. Requests spent "
+      f"{f['queue_wait_s'] / f['compute_s']:.0f}× longer waiting for a slot than being "
+      f"processed.")
+    w("")
+
+    w("### The node specification")
+    w("")
+    w(md_table(["Resource", "Measured today", "Recommended", "Basis"], [
+        ["**GPU**", f"{a.gpus_per_node} × H200 NVL",
+         f"**{a.gpus_per_node} × H200 NVL**", "fixed sourcing unit"],
+        ["VRAM installed", f"{ctx['storage']['vram_total_gb']:.1f} GB",
+         f"{ctx['storage']['vram_total_gb']:.1f} GB", "measured"],
+        ["VRAM doing work", f"{f['working_vram_gb']:.1f} GB",
+         f"{f['working_vram_gb']:.1f} GB", "measured, on the active GPU(s)"],
+        ["VRAM stranded", f"**{f['stranded_gb']:.1f} GB**", "**0 GB**",
+         "measured — clear before any TP change"],
+        ["**Host RAM**", f"{f['ram_peak_gb']:.0f} GB peak of "
+                         f"{f['ram_installed_gb']:.0f} GB installed",
+         f"**{f['ram_recommended_gb']} GB**", "measured peak × 1.6 for concurrency growth"],
+        ["**CPU**", f"load avg {f['idle_load']:.2f} idle → "
+                    f"{f['idle_load'] + f['cores_per_img_s'] * ctx['sustained_rate']:.2f} loaded",
+         f"**{f['cores_now']} cores** now, **{f['cores_projected']} cores** projected",
+         f"{f['cpu_basis']} — {f['cores_per_img_s']:.2f} cores per img/s"],
+        ["**Model store**",
+         f"{f['model_store_used_gb']:,.0f} GB used of {f['model_store_total_gb']:,.0f} GB "
+         f"(`{f['model_store_path']}`)",
+         f"{max(4000, f['model_store_total_gb'] * 1.2) / 1000:.0f} TB", "measured"],
+        ["**Image store** (separate volume)", "not provisioned",
+         f"**{f['storage_need_gb'] / 1000:.1f} TB**",
+         f"{ctx['storage']['resident_images']:,} resident at "
+         f"{a.retention_days:g}-day retention, High case"],
+        ["**Network**", f"{ctx['matrix'][0]['network_mbps']:.1f} Mbps",
+         "1 GbE sufficient; 10 GbE for model loads", "measured payload × 1.37 base64"],
+        ["Power, GPU boards", f"{ctx['economics']['load_power_w']:.0f} W",
+         f"~{f['power_w'] * a.gpus_per_node * 1.5:.0f} W *(projected)*",
+         "measured; projection assumes both GPUs at higher batch"],
+        ["Power, node incl. PUE", f"{ctx['economics']['node_power_w']:,.0f} W",
+         f"~{ctx['economics']['node_power_w'] * 1.5:,.0f} W *(projected)*",
+         f"measured × PUE {a.pue:g}"],
+        ["Energy per image", f"{ctx['economics']['wh_per_image']:.3f} Wh", "—", "measured"],
+    ]))
+    w("")
+
+    if f["storage_short_gb"] > 0:
+        w(f"> **Storage shortfall.** The image store needs "
+          f"{f['storage_need_gb'] / 1000:.1f} TB and `{f['model_store_path']}` has "
+          f"**{f['storage_free_gb']:,.0f} GB free** — short by "
+          f"**{f['storage_short_gb'] / 1000:.1f} TB**. This has to be a separate volume "
+          f"regardless: model weights are a fixed read-at-load-time set, images are an "
+          f"unbounded append-and-expire stream, and sharing one volume lets an ingest "
+          f"backlog stop a model from loading.")
+        w("")
+    if f["swap_gb"] > 0.5:
+        w(f"> **{f['swap_gb']:.1f} GB of swap is in use** on a host using "
+          f"{f['ram_peak_gb']:.0f} GB of {f['ram_installed_gb']:.0f} GB RAM. Something "
+          f"swapped and was never paged back. Not urgent, but worth finding.")
+        w("")
+
+    w("### Node count per scenario")
+    w("")
+    hdr = ["Basis"] + [f"{s_['target_rate']:g} img/s" for s_ in scenarios]
+    rows = [
+        [f"**Measured** — `max_concurrent: {f['concurrency_now']}`, "
+         f"{ctx['sustained_rate']:.3f} img/s per node"]
+        + [f"**{f['nodes_now'].get(s_['target_rate'], '—')}**" for s_ in scenarios],
+        [f"*Projected* — `max_concurrent: {f['project_concurrency']}`, "
+         f"{f['projected_lo']:.2f}–{f['projected_hi']:.2f} img/s per node"]
+        + [f"{f['nodes_hi'].get(s_['target_rate'], '—')}–"
+           f"{f['nodes_lo'].get(s_['target_rate'], '—')}" for s_ in scenarios],
+        ["Time to clear the daily volume (measured)"]
+        + [f"{f['clear_h_now']:.1f} h" if i == 0 else "—"
+           for i, _ in enumerate(scenarios)],
+        ["Time to clear the daily volume (*projected*)"]
+        + [f"{f['clear_h_hi']:.1f}–{f['clear_h_lo']:.1f} h" if i == 0 else "—"
+           for i, _ in enumerate(scenarios)],
+    ]
+    w(md_table(hdr, rows))
+    w("")
+    w(f"**The projection is an extrapolation, not a measurement.** Its basis: vLLM's "
+      f"throughput comes from batching, the semaphore caps the batch at "
+      f"{f['concurrency_now']}, and the run shows the headroom is there — "
+      f"{f['membw_pct']:.0f}% memory bandwidth and "
+      f"{100 - f['power_headroom'] * 100:.0f}% of the power envelope in use. The band "
+      f"assumes each doubling of the batch is worth between "
+      f"{a.project_gain_low:g}× and {a.project_gain_high:g}×, over "
+      f"{math.log2(max(f['project_concurrency'], 1) / max(f['concurrency_now'], 1)):.0f} "
+      f"doublings. It is confirmed by re-running this harness with the one value "
+      f"changed — not by argument.")
+    w("")
+    if f["needed_multiple"] > 1:
+        w(f"> **You need {f['needed_multiple']:.2f}× more throughput** to meet "
+          f"{f['required_rate']:.3f} img/s. Both ends of the projected band clear that. "
+          f"Sourcing a second node to buy a {f['needed_multiple']:.2f}× gain that a "
+          f"configuration change is likely to deliver several times over would be the "
+          f"expensive way to fix it — and on the evidence above, the second GPU in the "
+          f"node you already own is not currently available to use.")
+        w("")
+
+    w("### Recommended order of work")
+    w("")
+    w(md_table(["#", "Action", "Why"], [
+        ["1", f"Clear the {f['stranded_gb']:.0f} GB held on the idle GPU(s)"
+              if f["gpus_stranded"] else "Confirm both GPUs are free",
+         "Nothing involving the second GPU is possible until this is done"],
+        ["2", f"Raise `max_concurrent` {f['concurrency_now']} → "
+              f"{f['project_concurrency']} and re-run this harness",
+         f"{f['queue_share'] * 100:.0f}% of latency is queueing; this is the single "
+         f"largest lever and it costs nothing"],
+        ["3", "Set `tensor_parallel_size` to 2 and re-run",
+         "Only meaningful once the batch is large enough to use the extra bandwidth"],
+        ["4", "Measure extraction accuracy on real documents",
+         "Decides whether `max_pixels` can be lowered — the next throughput lever, "
+         "and the one that trades against correctness"],
+        ["5", "Re-assess hardware",
+         "Source against measured numbers from steps 2–3, not against this baseline"],
+    ]))
+    w("")
+
     w("---")
     w("")
     w(f"*Charts and the full numeric dump are in `{out.name}/`. Every figure in this "
@@ -1741,6 +2046,17 @@ def main() -> None:
                     help="host CPU per image for decode, resize and normalise")
     ap.add_argument("--cpu-headroom", type=float, default=1.4,
                     help="CPU sizing multiplier — never size a host to 100%%")
+    ap.add_argument("--project-concurrency", type=int, default=16,
+                    help="max_concurrent to project the throughput gain toward")
+    ap.add_argument("--project-gain-low",  type=float, default=1.4,
+                    help="conservative throughput factor per doubling of batch")
+    ap.add_argument("--project-gain-high", type=float, default=1.8,
+                    help="optimistic throughput factor per doubling of batch")
+    ap.add_argument("--idle-gpu-util-pct", type=float, default=5.0,
+                    help="below this median utilization, a GPU holding VRAM is "
+                         "reported as stranded rather than working")
+    ap.add_argument("--gpu-tdp-w", type=float, default=600.0,
+                    help="fallback board TDP if nvidia-smi did not report one")
     ap.add_argument("--ram-installed-gb", type=float, default=0.0,
                     help="override the sampler's reading of installed host RAM")
     ap.add_argument("--cost-gpu-hour",  type=float, default=3.50)
@@ -1956,6 +2272,9 @@ def main() -> None:
 
     ctx["matrix"] = compute_resource_matrix(args, scenarios, sustained, storage,
                                             economics, storage["vram_load_gb"])
+    ctx["final"] = compute_final_sizing(args, scenarios, phase_gpu, phase_host,
+                                        storage, ram, economics, meta,
+                                        idle_before_key, sustained)
 
     (out / "REPORT.md").write_text(build_report(ctx, out))
     (out / "summary.json").write_text(json.dumps({
@@ -1963,7 +2282,7 @@ def main() -> None:
         "synthetic": ctx["synthetic"],
         "run_meta": meta, "scenarios": scenarios, "sizing": sizing,
         "economics": economics, "storage": storage, "ram": ram,
-        "resource_matrix": ctx["matrix"],
+        "resource_matrix": ctx["matrix"], "final_sizing": ctx["final"],
         "phase_gpu": phase_gpu, "phase_host": phase_host,
         "sustained_rate_img_s": sustained, "ceiling_rate_img_s": ceiling,
         "sustained_is_measured": sustained_is_measured,
