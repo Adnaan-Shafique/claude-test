@@ -45,6 +45,10 @@ from pathlib import Path
 
 import requests
 
+# Each run must be self-describing. An A/B between serving configurations is
+# worthless if you cannot later prove which directory was which, and a
+# filename is not proof — the server's own /models output is.
+
 # ── The production unit of work ──────────────────────────────────────────────
 # One page in, structured JSON out, with OCR'd values. Output length is the
 # dominant cost term in a VLM serving workload, so this prompt is written to
@@ -166,6 +170,47 @@ class LoadGen:
             s.mount("https://", adapter)
             self.session_local.s = s
         return s
+
+    def capture_server_config(self) -> dict:
+        """Snapshot the GPU server's live registry and VRAM state before load.
+
+        This is what makes an A/B honest: tensor_parallel_size,
+        gpu_memory_utilization, max_concurrent and max_model_len are recorded
+        from the running server, not from whatever the operator believed was
+        deployed.
+        """
+        base = self.args.proxy.rstrip("/")
+        out: dict = {}
+        for label, path in (("models", "/v1/models"), ("gpu_health", "/v1/gpu-health")):
+            try:
+                resp = requests.get(f"{base}{path}",
+                                    headers={"X-API-Key": self.args.api_key}, timeout=30)
+                out[label] = resp.json() if resp.status_code == 200 else {
+                    "error": f"HTTP {resp.status_code}"}
+            except Exception as exc:
+                out[label] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        entry = None
+        models = out.get("models")
+        if isinstance(models, list):
+            entry = next((m for m in models if m.get("name") == self.args.model), None)
+        elif isinstance(models, dict):
+            for m in (models.get("models") or []):
+                if isinstance(m, dict) and m.get("name") == self.args.model:
+                    entry = m
+                    break
+        out["model_entry"] = entry
+
+        if entry:
+            print(f"Server config for '{self.args.model}': "
+                  f"TP={entry.get('tensor_parallel_size')} "
+                  f"gpu_mem_util={entry.get('gpu_memory_utilization')} "
+                  f"max_concurrent={entry.get('max_concurrent')} "
+                  f"max_model_len={entry.get('max_model_len')}")
+        else:
+            print(f"!! Could not read server config for '{self.args.model}' — the A/B "
+                  f"comparison will not be able to label this run.")
+        return out
 
     def _record(self, r: Result) -> None:
         with self.res_lock:
@@ -331,7 +376,9 @@ class LoadGen:
         print(f"\nCorpus: {len(self.corpus)} images, "
               f"{self.corpus.total_bytes / 1e6:.1f} MB, mode={self.args.image_mode}")
         print(f"Target: {self.url}  model={self.args.model} "
-              f"max_new_tokens={self.args.max_new_tokens}\n")
+              f"max_new_tokens={self.args.max_new_tokens}")
+        server_config = self.capture_server_config()
+        print()
 
         with ThreadPoolExecutor(max_workers=self.args.max_inflight + 8) as pool:
             for phase in phases:
@@ -389,6 +436,8 @@ class LoadGen:
             "corpus_bytes":   self.corpus.total_bytes,
             "corpus_avg_kb":  round(self.corpus.total_bytes / len(self.corpus) / 1e3, 1),
             "mock_detected":  self.mock_seen,
+            "run_label":      self.args.label,
+            "server_config":  server_config,
             "prompt":         self.args.prompt,
             "system":         self.args.system,
             "phases":         marks,
@@ -451,6 +500,8 @@ def main() -> None:
                     help="'path' only works if the corpus is on the GPU box")
     ap.add_argument("--prompt",  default=DEFAULT_PROMPT)
     ap.add_argument("--system",  default=DEFAULT_SYSTEM)
+    ap.add_argument("--label",   default="",
+                    help="name for this run in an A/B comparison, e.g. 'TP1-0.60-c2'")
     ap.add_argument("--seed",    type=int, default=20250915)
     args = ap.parse_args()
 

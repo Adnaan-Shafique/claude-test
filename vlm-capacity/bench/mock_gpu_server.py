@@ -35,6 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CFG = {
     "max_concurrent":   2,
+    "tensor_parallel_size":   1,
+    "gpu_memory_utilization": 0.60,
     "queue_timeout":    60.0,
     "vision_prefill_s": 0.35,    # per image, once the sequence is scheduled
     "base_decode_tps":  62.0,    # tokens/sec for a single resident sequence
@@ -66,6 +68,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/health":
             self._json(200, {"status": "ok", "mock": True,
                              "max_concurrent": CFG["max_concurrent"]})
+        elif self.path in ("/v1/models", "/models"):
+            # Shaped like the GPU server's ModelInfo list so loadgen's
+            # config capture — and therefore compare.py's A/B labelling —
+            # is exercised by a dry run rather than first meeting reality.
+            self._json(200, [{
+                "name": "qwen3-vl", "loaded": True, "lazy": True, "modality": "vision",
+                "tensor_parallel_size":   CFG["tensor_parallel_size"],
+                "gpu_memory_utilization": CFG["gpu_memory_utilization"],
+                "max_concurrent":         CFG["max_concurrent"],
+                "max_model_len":          32768, "max_images": 4,
+                "quantization": None, "error": None, "mock": True,
+            }])
+        elif self.path in ("/v1/gpu-health", "/health"):
+            self._json(200, {"status": "ok", "mock": True,
+                             "loaded_models": ["qwen3-vl"], "vram": []})
         elif self.path in ("/v1/metrics", "/metrics"):
             self._json(200, {"models": {"qwen3-vl": {"requests_active": _active}},
                              "mock": True})
@@ -144,11 +161,17 @@ def main() -> None:
     ap.add_argument("--queue-timeout", type=float, default=60.0,
                     help="mirrors QUEUE_TIMEOUT_S in the GPU server")
     ap.add_argument("--decode-tps", type=float, default=62.0)
+    ap.add_argument("--tp", type=int, default=1,
+                    help="tensor_parallel_size to REPORT via /v1/models (label only)")
+    ap.add_argument("--gpu-mem-util", type=float, default=0.60,
+                    help="gpu_memory_utilization to REPORT via /v1/models (label only)")
     args = ap.parse_args()
 
     CFG["max_concurrent"] = args.max_concurrent
     CFG["queue_timeout"]  = args.queue_timeout
     CFG["base_decode_tps"] = args.decode_tps
+    CFG["tensor_parallel_size"]   = args.tp
+    CFG["gpu_memory_utilization"] = args.gpu_mem_util
     _sem = threading.Semaphore(args.max_concurrent)
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)

@@ -197,6 +197,73 @@ rate with one of those broken. `FAILED` is anything less.
 
 ---
 
+## Proving what the second GPU is worth
+
+The registry currently runs `qwen3-vl` at `tensor_parallel_size: 1`,
+`gpu_memory_utilization: 0.60` — one card, with the second idle. The obvious
+test is "run it on 1 GPU, show it's not enough, conclude we need 2." That test
+will almost certainly return a null result, for a reason worth walking through
+before you spend H200 time on it.
+
+**The current setup is not VRAM-bound.** On one card:
+
+| | |
+|---|---|
+| Budget at `0.60` | `0.60 × 141 GB` ≈ **85 GB** |
+| Weights (30.5B @ bf16) | ≈ **61 GB** |
+| Left for KV cache | ≈ **21 GB** |
+| KV per token (48 layers × 4 KV heads × 128 dim × 2 × 2 B) | ≈ **96 kB** |
+| KV capacity | ≈ **220,000 tokens** |
+| One image request (~1,350 vision + prompt + output) | ≈ **2,500 tokens** |
+| **Concurrent sequences the KV cache could hold** | **≈ 85** |
+
+Verify the per-token figure against your `config.json` — it is estimated from
+the Qwen3-30B-A3B base. Even if it is off by 2×, the conclusion holds:
+`max_concurrent: 2` uses a **low single-digit percentage** of the KV cache that
+one GPU already has. Neither TP=1 nor TP=2 is the binding constraint. The
+semaphore is. Compare TP=1 against TP=2 without touching it and both land on
+roughly the same number.
+
+So run three configurations, in this order:
+
+| Run | `tensor_parallel_size` | `gpu_memory_utilization` | `max_concurrent` | GPUs |
+|---|---|---|---|---|
+| **A** baseline | 1 | 0.60 | 2 | 1 |
+| **B** semaphore raised | 1 | 0.60 | 32 | 1 |
+| **C** second GPU added | 2 | 0.35 | 32 | 2 |
+
+`B − A` is what the config change was worth on one GPU. `C − B` is what the
+second GPU was worth. **Only the second is a hardware argument** — run A against
+C directly and the config change's gain gets attributed to the silicon.
+
+```bash
+for cfg in A B C; do
+  # edit MODEL_CONFIGS["qwen3-vl"] per the table, restart the GPU server, then:
+  GPU_SSH=root@10.66.98.137 RESULTS=./results-$cfg ./bench/run_all.sh
+done
+
+python3 bench/compare.py --out ./report-compare \
+    --run "A baseline TP=1 c=2:./results-A" \
+    --run "B semaphore TP=1 c=32:./results-B" \
+    --run "C two GPUs TP=2 c=32:./results-C"
+```
+
+Each run records the server's live `/v1/models` output into `run_meta.json`, so
+`compare.py` labels runs from what was **actually deployed** rather than from
+the directory name. A run whose config could not be read is flagged as not
+safely comparable.
+
+**Where TP=2 genuinely helps**, once the batch is large enough to use it:
+`2 × (0.35 × 141 − 30.5 − ~3)` ≈ **32 GB of KV** versus 21 GB on one card, and
+**double the aggregate memory bandwidth** — and decode is bandwidth-bound. That
+is a real mechanism. It just cannot show up while the batch is capped at 2.
+
+If run B already clears 0.67 img/s with headroom — on the arithmetic above, it
+should — then the defensible conclusion is *one GPU covers the committed
+workload; the second buys burst headroom, model-swap capacity and failover*.
+`compare.py` writes that conclusion itself, in whichever direction the data
+points.
+
 ## Sizing assumptions
 
 The report sizes the estate as **one node of 2 × H200 NVL**, and sizes storage
