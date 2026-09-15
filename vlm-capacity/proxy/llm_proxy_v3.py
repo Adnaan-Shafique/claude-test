@@ -337,6 +337,19 @@ async def gpu_health():
     return await _get_upstream_json("/health")
 
 
+@app.get("/v1/gpu-models")
+async def gpu_models():
+    """The GPU server's live registry — tensor_parallel_size,
+    gpu_memory_utilization, max_concurrent, max_model_len, per model.
+
+    /v1/models above returns the PROXY's allowlist, which is only a list of
+    names. A benchmark needs to record the configuration that was actually
+    serving, and a name cannot prove that, so this passes the real registry
+    through.
+    """
+    return await _get_upstream_json("/models")
+
+
 @app.get("/v1/metrics")
 async def gpu_metrics():
     return await _get_upstream_json("/metrics")

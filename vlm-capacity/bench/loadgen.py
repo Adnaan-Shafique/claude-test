@@ -158,6 +158,12 @@ class LoadGen:
         # run_meta.json so analyze.py stamps the report SYNTHETIC and a dry-run
         # can never be mistaken for a capacity measurement.
         self.mock_seen = False
+        # A VLM answering blind still returns HTTP 200. Throughput alone cannot
+        # distinguish 'processed 300 images' from 'returned 300 responses to a
+        # prompt it could not see', so a sample of real answers is kept for
+        # inspection and the report's credibility rests on it.
+        self.samples: list[dict] = []
+        self.samples_lock = threading.Lock()
 
     def _session(self) -> requests.Session:
         """One HTTP session per worker thread — sharing one Session across
@@ -181,7 +187,12 @@ class LoadGen:
         """
         base = self.args.proxy.rstrip("/")
         out: dict = {}
-        for label, path in (("models", "/v1/models"), ("gpu_health", "/v1/gpu-health")):
+        # /v1/gpu-models is the GPU server's real registry. /v1/models is only
+        # the proxy's allowlist of names and cannot describe a configuration;
+        # it is kept as a fallback for a proxy too old to have the passthrough.
+        for label, path in (("gpu_models", "/v1/gpu-models"),
+                            ("models", "/v1/models"),
+                            ("gpu_health", "/v1/gpu-health")):
             try:
                 resp = requests.get(f"{base}{path}",
                                     headers={"X-API-Key": self.args.api_key}, timeout=30)
@@ -190,15 +201,19 @@ class LoadGen:
             except Exception as exc:
                 out[label] = {"error": f"{type(exc).__name__}: {exc}"}
 
-        entry = None
-        models = out.get("models")
-        if isinstance(models, list):
-            entry = next((m for m in models if m.get("name") == self.args.model), None)
-        elif isinstance(models, dict):
-            for m in (models.get("models") or []):
+        def _find(payload) -> Optional[dict]:
+            """The registry may arrive as a bare list or wrapped in {"models": ...}."""
+            items = payload
+            if isinstance(payload, dict):
+                items = payload.get("models")
+            if not isinstance(items, list):
+                return None
+            for m in items:
                 if isinstance(m, dict) and m.get("name") == self.args.model:
-                    entry = m
-                    break
+                    return m
+            return None
+
+        entry = _find(out.get("gpu_models")) or _find(out.get("models"))
         out["model_entry"] = entry
 
         if entry:
@@ -209,7 +224,9 @@ class LoadGen:
                   f"max_model_len={entry.get('max_model_len')}")
         else:
             print(f"!! Could not read server config for '{self.args.model}' — the A/B "
-                  f"comparison will not be able to label this run.")
+                  f"comparison will not be able to label this run.\n"
+                  f"   Check that the proxy exposes /v1/gpu-models (llm_proxy_v3) and "
+                  f"that it can reach the GPU server's /models.")
         return out
 
     def _record(self, r: Result) -> None:
@@ -244,6 +261,16 @@ class LoadGen:
                 body = resp.json()
                 if body.get("mock"):
                     self.mock_seen = True
+                if self.args.save_samples:
+                    with self.samples_lock:
+                        if len(self.samples) < self.args.save_samples:
+                            self.samples.append({
+                                "image":         name,
+                                "prompt_tokens": body.get("prompt_tokens"),
+                                "new_tokens":    body.get("new_tokens"),
+                                "images_echoed": body.get("images"),
+                                "text":          (body.get("text") or "")[:4000],
+                            })
                 self._record(Result(
                     scenario, seq, scheduled_ts, send_ts, recv_ts,
                     round(recv_ts - send_ts, 4), "ok", 200,
@@ -444,6 +471,33 @@ class LoadGen:
         }
         (out / "run_meta.json").write_text(json.dumps(meta, indent=2))
 
+        if self.samples:
+            # Identical answers across different pages is the signature of a model
+            # that never received the pixels — the single most important thing to
+            # rule out before any of these numbers are quoted.
+            distinct = len({s_["text"] for s_ in self.samples})
+            payload = {
+                "note": "Read these. Different invoices must produce different "
+                        "values. Identical answers mean the model did not see the "
+                        "images and every throughput figure in the report is "
+                        "measuring the wrong workload.",
+                "samples_captured": len(self.samples),
+                "distinct_responses": distinct,
+                "images_echoed_by_server": sorted(
+                    {s_.get("images_echoed") for s_ in self.samples}),
+                "samples": self.samples,
+            }
+            (out / "samples.json").write_text(json.dumps(payload, indent=2))
+            print(f"\nSaved {len(self.samples)} response samples "
+                  f"({distinct} distinct) → {out / 'samples.json'}")
+            if distinct <= 1 and len(self.samples) > 1:
+                print("  !! ALL SAMPLED RESPONSES ARE IDENTICAL. Verify the model is "
+                      "actually receiving images before trusting this run.")
+            echoed = {s_.get("images_echoed") for s_ in self.samples}
+            if echoed and echoed <= {0, None}:
+                print("  !! The server echoed images=0 for every request — the images "
+                      "are not reaching the model.")
+
         print(f"\nWrote:\n  {req_path}\n  {ph_path}\n  {out / 'run_meta.json'}")
         print(f"Total wall time: {(time.time() - run_start) / 60:.1f} min")
 
@@ -500,6 +554,8 @@ def main() -> None:
                     help="'path' only works if the corpus is on the GPU box")
     ap.add_argument("--prompt",  default=DEFAULT_PROMPT)
     ap.add_argument("--system",  default=DEFAULT_SYSTEM)
+    ap.add_argument("--save-samples", type=int, default=5,
+                    help="keep this many response bodies for verification (0 = none)")
     ap.add_argument("--label",   default="",
                     help="name for this run in an A/B comparison, e.g. 'TP1-0.60-c2'")
     ap.add_argument("--seed",    type=int, default=20250915)
