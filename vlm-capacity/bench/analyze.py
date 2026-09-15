@@ -52,6 +52,16 @@ MUTED     = "#898781"
 GRID      = "#e1e0d9"
 BASELINE  = "#c3c2b7"
 
+# bf16 on-disk weight sizes for the registry in gpu_api_server_v6.py. Used only
+# when the sampler could not read the model store; measured disk usage wins.
+MODEL_WEIGHT_GB = {
+    "Mistral-7B-Instruct":      15,
+    "Qwen3-32B":                64,
+    "CodeStral-22B":            44,
+    "Qwen3-VL-30B-A3B":         61,
+    "InternVL3_5-38B":          76,
+}
+
 STATUS_COLOR = {"SUSTAINABLE": ST_GOOD, "DEGRADED": ST_WARN, "FAILED": ST_CRIT}
 STATUS_ICON  = {"SUSTAINABLE": "✔", "DEGRADED": "▲", "FAILED": "✖"}
 
@@ -271,6 +281,137 @@ def host_window_stats(host_rows: list[dict], t0: float, t1: float, offset: float
         "disk_used_pct": round(max(fnum(r, "disk_used_pct") for r in sel), 1),
         "disk_path":     sel[-1].get("disk_path", ""),
     }
+
+
+
+# ═══════════════════════════ storage & RAM sizing ═════════════════════════════
+
+def compute_storage(args, meta: dict, scenarios: list[dict], host: dict) -> dict:
+    """Size the image store three ways.
+
+    The measured corpus average is only a sample of one document class, so a
+    single number would be a false precision. Low / Expected / High bracket the
+    realistic range, and the recommendation is built on High — under-provisioning
+    storage is the failure that takes the pipeline down, and disk is the cheapest
+    thing in this entire report.
+    """
+    resident = int(round(args.daily_images * args.retention_days))
+
+    measured_kb = float(meta.get("corpus_avg_kb", 0) or 0)
+    expected_kb = measured_kb if measured_kb > 0 else 250.0
+    # The bracket must actually bracket the Expected case. A corpus lighter than
+    # the Low assumption (or heavier than High) would otherwise produce a table
+    # whose columns are not monotonic, which reads as an error even when each
+    # number is right.
+    low_kb  = min(args.image_kb_low, expected_kb)
+    high_kb = max(args.image_kb_high, expected_kb)
+
+    mean_out_tokens = float(np.mean([s["new_tokens"]["mean"] for s in scenarios])) if scenarios else 0.0
+    json_kb = max(mean_out_tokens * 4 / 1024.0, 0.5)   # ~4 bytes/token
+
+    # Measured model store wins; the registry table is the fallback.
+    measured_models = float(host.get("disk_used_gb", 0) or 0)
+    registry_models = float(sum(MODEL_WEIGHT_GB.values()))
+    models_gb = measured_models if measured_models > 0 else registry_models
+
+    cases = {}
+    for label, img_kb, json_mult, derived_frac, log_kb in (
+        ("Low",      low_kb,      1.0, 0.00, 1.0),
+        ("Expected", expected_kb, 1.0, 0.10, 2.0),
+        ("High",     high_kb,     4.0, 0.25, 10.0),
+    ):
+        raw_gb     = resident * img_kb / 1e6
+        json_gb    = resident * json_kb * json_mult / 1e6
+        derived_gb = raw_gb * derived_frac
+        logs_gb    = resident * log_kb / 1e6
+        data_gb    = raw_gb + json_gb + derived_gb + logs_gb
+
+        # Replication applies to the pipeline's data, not to model weights —
+        # weights are re-fetchable from the vendor and are not a backup concern.
+        replicated = data_gb * args.replica_factor
+        # Never plan a filesystem to 100%: allocation slows and fragments well
+        # before full, and a store that cannot accept today's batch stops the line.
+        provisioned = (replicated / args.fs_high_water) * args.growth_headroom
+
+        cases[label] = {
+            "image_kb": img_kb, "raw_gb": raw_gb, "json_gb": json_gb,
+            "derived_gb": derived_gb, "logs_gb": logs_gb, "data_gb": data_gb,
+            "replicated_gb": replicated, "provisioned_gb": provisioned,
+            "provisioned_tb": provisioned / 1000.0,
+            "daily_ingest_gb": args.daily_images * img_kb / 1e6,
+        }
+
+    return {
+        "resident_images": resident, "retention_days": args.retention_days,
+        "json_kb_per_image": json_kb, "measured_corpus_kb": measured_kb,
+        "models_gb": models_gb, "models_measured": measured_models > 0,
+        "registry_models_gb": registry_models,
+        "disk_free_gb": float(host.get("disk_free_gb", 0) or 0),
+        "disk_total_gb": float(host.get("disk_total_gb", 0) or 0),
+        "disk_path": host.get("disk_path", "n/a"),
+        "cases": cases,
+    }
+
+
+def compute_ram(args, scenarios: list[dict], host: dict, storage: dict) -> dict:
+    """Size host RAM three ways, against concurrency rather than a rule of thumb.
+
+    The term that actually scales is the request path: every in-flight image is
+    held as a base64 string, a decoded RGB bitmap, and a preprocessed tensor at
+    the same time. At max_concurrent 2 that is invisible; at the 16-32 this
+    report recommends, it is the largest variable consumer.
+    """
+    measured_gb    = float(host.get("ram_used_gb", {}).get("mean", 0) or 0) if host else 0.0
+    measured_peak  = float(host.get("ram_used_gb", {}).get("max", 0) or 0) if host else 0.0
+    installed_gb   = args.ram_installed_gb or float(host.get("ram_total_gb", 0) or 0)
+
+    # Per in-flight image, host-side:
+    #   base64 payload ~1.37x the file, decoded RGB up to 2048x2048x3 = 12.6 MB,
+    #   preprocessed tensor and transient copies on top.
+    per_image_mb = {"Low": 12.0, "Expected": 28.0, "High": 55.0}
+    images_per_req = int(args.images_per_request)
+    active_model_gb = MODEL_WEIGHT_GB["Qwen3-VL-30B-A3B"]
+
+    cases = {}
+    for label, concurrency, cache_frac in (
+        ("Low  (max_concurrent 2, today)",     2,                    0.0),
+        ("Expected (max_concurrent 16)",       16,                   1.0),
+        ("High (max_concurrent 32 + both VLMs cached)", 32,          2.2),
+    ):
+        os_gb      = 8.0
+        # One CUDA context plus NCCL and allocator overhead per GPU.
+        cuda_gb    = 6.0 * args.gpus_per_node
+        runtime_gb = 10.0                       # torch, vLLM, tokenizers, processors
+        stage_gb   = 16.0                       # transient peak while streaming weights in
+        req_gb     = concurrency * images_per_req * per_image_mb[
+            "Low" if concurrency <= 2 else ("Expected" if concurrency <= 16 else "High")
+        ] / 1024.0
+        # Page cache is not required for correctness, but without it every model
+        # swap re-reads tens of GB from disk inside a request's latency budget.
+        cache_gb   = active_model_gb * cache_frac
+
+        working = os_gb + cuda_gb + runtime_gb + stage_gb + req_gb
+        total   = working + cache_gb
+        cases[label] = {
+            "concurrency": concurrency, "os_gb": os_gb, "cuda_gb": cuda_gb,
+            "runtime_gb": runtime_gb, "stage_gb": stage_gb, "request_gb": req_gb,
+            "cache_gb": cache_gb, "working_gb": working, "total_gb": total,
+            "recommended_gb": _round_to_dimm(total),
+        }
+
+    return {
+        "measured_mean_gb": measured_gb, "measured_peak_gb": measured_peak,
+        "installed_gb": installed_gb, "images_per_request": images_per_req,
+        "active_model_gb": active_model_gb, "cases": cases,
+    }
+
+
+def _round_to_dimm(gb: float) -> int:
+    """Round up to a capacity you can actually buy as a balanced DIMM population."""
+    for step in (64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048):
+        if gb <= step:
+            return step
+    return int(math.ceil(gb / 1024.0) * 1024)
 
 
 # ═══════════════════════════════ charts ═══════════════════════════════════════
@@ -583,6 +724,119 @@ def chart_sizing(path: Path, sizing: list[dict]):
     return True
 
 
+
+def _stacked(ax, labels, components, colors, unit: str, min_label_frac: float = 0.055):
+    """Stacked bars with a 2px surface gap between segments, and a direct label
+    on every segment big enough to carry one — three of these hues sit under 3:1
+    on the light surface, so the labels are the relief, not decoration."""
+    x = np.arange(len(labels))
+    bottoms = np.zeros(len(labels))
+    totals = np.sum([vals for _, vals in components], axis=0)
+    for (name, vals), color in zip(components, colors):
+        vals = np.asarray(vals, dtype=float)
+        ax.bar(x, vals, bottom=bottoms, width=0.55, color=color, label=name,
+               linewidth=2, edgecolor=SURFACE)
+        for xi, (v, b, t) in enumerate(zip(vals, bottoms, totals)):
+            if t > 0 and v / t >= min_label_frac:
+                ax.annotate(f"{v:,.0f}", xy=(xi, b + v / 2), ha="center", va="center",
+                            fontsize=8, color=SURFACE, fontweight="bold")
+        bottoms += vals
+    for xi, t in enumerate(totals):
+        ax.annotate(f"{t:,.0f} {unit}", xy=(xi, t), xytext=(0, 5),
+                    textcoords="offset points", ha="center", fontsize=9.5,
+                    color=INK, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_ylim(0, float(totals.max()) * 1.18 if totals.max() else 1)
+    return totals
+
+
+def chart_storage(path: Path, storage: dict, args):
+    cases = storage["cases"]
+    labels = list(cases)
+    components = [
+        ("Raw images",       [cases[c]["raw_gb"]     for c in labels]),
+        ("Derived / thumbs", [cases[c]["derived_gb"] for c in labels]),
+        ("Extracted JSON",   [cases[c]["json_gb"]    for c in labels]),
+        ("Audit logs",       [cases[c]["logs_gb"]    for c in labels]),
+    ]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.8))
+
+    _stacked(ax1, labels, components, [C_S1, C_S2, C_S3, "#eda100"], "GB")
+    ax1.set_xticklabels(labels, fontsize=9)
+    ax1.set_ylabel("GB")
+    ax1.set_title("Live data at rest", loc="left", fontsize=11.5, color=INK,
+                  pad=24, fontweight="bold")
+    ax1.annotate(f"{storage['resident_images']:,} images "
+                 f"({args.retention_days:g}-day retention), one copy",
+                 xy=(0, 1.0), xycoords="axes fraction", xytext=(0, 7),
+                 textcoords="offset points", fontsize=8.5, color=MUTED,
+                 va="bottom", ha="left")
+    ax1.legend(fontsize=8.5, loc="upper left")
+
+    prov = [cases[c]["provisioned_gb"] for c in labels]
+    bars = ax2.bar(np.arange(len(labels)), prov, width=0.55, color=C_S1)
+    for b, v in zip(bars, prov):
+        ax2.annotate(f"{v / 1000:.1f} TB", xy=(b.get_x() + b.get_width() / 2, v),
+                     xytext=(0, 5), textcoords="offset points", ha="center",
+                     fontsize=9.5, color=INK, fontweight="bold")
+    ax2.set_xticks(np.arange(len(labels)))
+    ax2.set_xticklabels(labels, fontsize=9)
+    ax2.set_ylabel("GB provisioned")
+    ax2.set_ylim(0, max(prov) * 1.2 if prov else 1)
+    ax2.set_title("Capacity to provision", loc="left", fontsize=11.5, color=INK,
+                  pad=24, fontweight="bold")
+    ax2.annotate(f"×{args.replica_factor:g} replicas ÷ {args.fs_high_water:.0%} "
+                 f"high-water ×{args.growth_headroom:g} growth",
+                 xy=(0, 1.0), xycoords="axes fraction", xytext=(0, 7),
+                 textcoords="offset points", fontsize=8.5, color=MUTED,
+                 va="bottom", ha="left")
+
+    fig.suptitle("Storage sizing", x=0.008, ha="left", fontsize=14, color=INK,
+                 fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def chart_ram(path: Path, ram: dict):
+    cases = ram["cases"]
+    labels = list(cases)
+    short = ["Low\n(today)", "Expected\n(concurrency 16)", "High\n(concurrency 32)"]
+    components = [
+        ("OS + daemons",        [cases[c]["os_gb"]      for c in labels]),
+        ("CUDA contexts",       [cases[c]["cuda_gb"]    for c in labels]),
+        ("Runtime (torch/vLLM)",[cases[c]["runtime_gb"] for c in labels]),
+        ("Weight-load staging", [cases[c]["stage_gb"]   for c in labels]),
+        ("In-flight images",    [cases[c]["request_gb"] for c in labels]),
+        ("Weight page cache",   [cases[c]["cache_gb"]   for c in labels]),
+    ]
+    fig, ax = plt.subplots(figsize=(10.5, 5.0))
+    _stacked(ax, labels, components,
+             [BASELINE, C_S1, C_S2, C_S3, "#eda100", "#e87ba4"], "GB")
+    # The provisioning figure belongs in the tick label. As a separate
+    # annotation below the axis it collided with the tick text.
+    ax.set_xticklabels(
+        [f"{lbl}\n→ provision {cases[c]['recommended_gb']} GB"
+         for lbl, c in zip(short[:len(labels)], labels)],
+        fontsize=9)
+    ax.set_ylabel("GB")
+
+    if ram["measured_peak_gb"] > 0:
+        ax.axhline(ram["measured_peak_gb"], color=ST_GOOD, lw=1.6, ls="--")
+        ax.annotate(f"measured peak this run: {ram['measured_peak_gb']:.1f} GB",
+                    xy=(-0.42, ram["measured_peak_gb"]), xytext=(0, 5),
+                    textcoords="offset points", ha="left", fontsize=8.5, color=ST_GOOD)
+
+    _titles(ax, "Host RAM sizing",
+            "the term that scales is in-flight images — concurrency × images/request")
+    ax.legend(fontsize=8.5, loc="upper left", ncol=2)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 # ═══════════════════════════════ report ═══════════════════════════════════════
 
 def md_table(headers: list[str], rows: list[list]) -> str:
@@ -823,7 +1077,7 @@ def build_report(ctx: dict, out: Path) -> str:
 
     w("### Host memory, storage and load")
     w("")
-    w(f"![Host RAM]({charts['ram']})")
+    w(f"![Host RAM]({charts['host_ram']})")
     w("")
     host_load = phase_host.get(scenarios[-1]["scenario"], {}) if scenarios else {}
     host_idle = phase_host.get(idle_key, {})
@@ -967,32 +1221,156 @@ def build_report(ctx: dict, out: Path) -> str:
     w("")
 
     # ── 8. Storage ──────────────────────────────────────────────────────────
-    st = ctx["storage"]
-    w("## 8. Storage")
+    st    = ctx["storage"]
+    ram   = ctx["ram"]
+    cases = st["cases"]
+    w("## 8. Storage sizing")
     w("")
-    w(md_table(["Component", "Size", "Note"], [
-        ["Image ingest, per day", f"{st['daily_gb']:.1f} GB",
-         f"{a.daily_images:,} × {meta.get('corpus_avg_kb', 0):.0f} kB measured average"],
-        [f"Image retention, {a.retention_days:g} days", f"**{st['retention_gb']:,.0f} GB**",
-         "raw images only; excludes extracted JSON and any derived artefacts"],
-        ["Extracted JSON, per day", f"{st['json_daily_mb']:.0f} MB",
-         f"{st['json_kb_per_image']:.1f} kB/image estimated from measured output tokens"],
-        ["Model weights on the GPU box", f"{st['models_measured_gb']:,.0f} GB used",
-         f"measured on `{st['disk_path']}`; {st['disk_free_gb']:,.0f} GB free of "
-         f"{st['disk_total_gb']:,.0f} GB"],
-        ["VRAM, Qwen3-VL resident", f"{st['vram_load_gb']:.1f} GB",
-         f"peak across both GPUs under load, of {st['vram_total_gb']:.0f} GB installed"],
+    w(f"At {a.daily_images:,} images/day held for {a.retention_days:g} days, "
+      f"**{st['resident_images']:,} images are resident at steady state**. The three "
+      f"cases below bracket the realistic range of page sizes — a single figure "
+      f"derived from one corpus would be false precision, and storage is the "
+      f"cheapest line in this report to over-provision.")
+    w("")
+    w(f"![Storage sizing]({charts['storage']})")
+    w("")
+    w(md_table(
+        ["Component", "Low", "Expected", "High", "Basis"],
+        [
+            ["Page size assumed",
+             f"{cases['Low']['image_kb']:,.0f} kB", f"{cases['Expected']['image_kb']:,.0f} kB",
+             f"{cases['High']['image_kb']:,.0f} kB",
+             "Low: compressed JPEG · Expected: "
+             + (f"measured ({st['measured_corpus_kb']:.0f} kB)" if st["measured_corpus_kb"]
+                else "assumed 250 kB") + " · High: high-DPI / lossless"],
+            ["Raw images at rest",
+             f"{cases['Low']['raw_gb']:,.0f} GB", f"{cases['Expected']['raw_gb']:,.0f} GB",
+             f"{cases['High']['raw_gb']:,.0f} GB",
+             f"{st['resident_images']:,} images × page size"],
+            ["Derived (thumbnails, normalised copies)",
+             f"{cases['Low']['derived_gb']:,.0f} GB", f"{cases['Expected']['derived_gb']:,.0f} GB",
+             f"{cases['High']['derived_gb']:,.0f} GB",
+             "0% / 10% / 25% of raw"],
+            ["Extracted JSON",
+             f"{cases['Low']['json_gb']:,.0f} GB", f"{cases['Expected']['json_gb']:,.0f} GB",
+             f"{cases['High']['json_gb']:,.0f} GB",
+             f"{st['json_kb_per_image']:.1f} kB/image from **measured** output tokens"],
+            ["Audit / request logs",
+             f"{cases['Low']['logs_gb']:,.0f} GB", f"{cases['Expected']['logs_gb']:,.0f} GB",
+             f"{cases['High']['logs_gb']:,.0f} GB",
+             "1 / 2 / 10 kB per image"],
+            ["**Live data, one copy**",
+             f"**{cases['Low']['data_gb']:,.0f} GB**", f"**{cases['Expected']['data_gb']:,.0f} GB**",
+             f"**{cases['High']['data_gb']:,.0f} GB**", "sum of the above"],
+            [f"× {a.replica_factor:g} replicas",
+             f"{cases['Low']['replicated_gb']:,.0f} GB", f"{cases['Expected']['replicated_gb']:,.0f} GB",
+             f"{cases['High']['replicated_gb']:,.0f} GB", "primary + backup"],
+            [f"**Provision** (÷ {a.fs_high_water:.0%} high-water × {a.growth_headroom:g} growth)",
+             f"**{cases['Low']['provisioned_gb']:,.0f} GB**",
+             f"**{cases['Expected']['provisioned_gb']:,.0f} GB**",
+             f"**{cases['High']['provisioned_gb']:,.0f} GB**",
+             "usable capacity to buy"],
+        ]))
+    w("")
+    w(f"### Recommendation: provision **{cases['High']['provisioned_tb']:.1f} TB** usable "
+      f"for the image store")
+    w("")
+    w(f"Size on the High case, not Expected. The delta is "
+      f"{cases['High']['provisioned_gb'] - cases['Expected']['provisioned_gb']:,.0f} GB — "
+      f"trivial against the GPU spend — and the failure mode it prevents is the one that "
+      f"stops the pipeline outright. Daily ingest runs "
+      f"{cases['Low']['daily_ingest_gb']:.1f}–{cases['High']['daily_ingest_gb']:.1f} GB/day, "
+      f"so the store reaches steady state after {a.retention_days:g} days and then stays "
+      f"flat as expiry balances ingest.")
+    w("")
+    w("### Model weights (separate volume)")
+    w("")
+    w(md_table(["Model", "bf16 weights"],
+               [[k, f"{v} GB"] for k, v in MODEL_WEIGHT_GB.items()]
+               + [["**Full registry resident**", f"**{st['registry_models_gb']:,.0f} GB**"]]))
+    w("")
+    if st["models_measured"]:
+        w(f"Measured on `{st['disk_path']}`: **{st['models_gb']:,.0f} GB used**, "
+          f"{st['disk_free_gb']:,.0f} GB free of {st['disk_total_gb']:,.0f} GB.")
+    else:
+        w("The sampler could not read the model store, so the registry table above is the "
+          "estimate. Re-run with `gpu_monitor.py --model-path` pointed at the real path.")
+    w("")
+    w(f"**Keep images and model weights on separate volumes.** They have opposite "
+      f"profiles: weights are a fixed ~{st['registry_models_gb']:,.0f} GB read almost "
+      f"exclusively at load time, images are an unbounded append-and-expire stream. Sharing "
+      f"one volume means a corpus backlog can fill the disk and leave a model unable to "
+      f"load — an ingest problem taking down inference.")
+    w("")
+    w("### VRAM")
+    w("")
+    w(md_table(["VRAM", "Value"], [
+        ["Installed across the node", f"{st['vram_total_gb']:.0f} GB "
+                                      f"({a.gpus_per_node} × H200 NVL)"],
+        ["Peak in use under load", f"{st['vram_load_gb']:.1f} GB"],
+        ["Headroom", f"{st['vram_total_gb'] - st['vram_load_gb']:.1f} GB"],
     ]))
     w("")
-    if st["disk_runway_days"] is not None:
-        w(f"At the measured ingest rate, the free space on `{st['disk_path']}` is "
-          f"**{st['disk_runway_days']:,.0f} days** of runway if raw images are stored there. "
-          f"They should not be — the model store and the image store should be separate "
-          f"volumes, so a corpus backlog can never prevent a model from loading.")
+
+    # ── 9. RAM ──────────────────────────────────────────────────────────────
+    rcases = ram["cases"]
+    rkeys  = list(rcases)
+    w("## 9. Host RAM sizing")
+    w("")
+    w(f"![RAM sizing]({charts['ram']})")
+    w("")
+    w("Most host-RAM terms here are fixed — OS, CUDA contexts, the runtime, the transient "
+      "peak while weights stream in. **The term that scales is the request path.** Every "
+      "in-flight image is simultaneously a base64 string, a decoded RGB bitmap, and a "
+      "preprocessed tensor. At today's `max_concurrent: 2` that is invisible; at the 16–32 "
+      "section 6 recommends, it becomes the largest variable consumer — so raising "
+      "concurrency is a RAM decision as well as a throughput one.")
+    w("")
+    w(md_table(
+        ["Consumer"] + [k.split("(")[0].strip() for k in rkeys] + ["Scales with"],
+        [
+            ["Concurrency assumed"] + [f"{rcases[k]['concurrency']}" for k in rkeys]
+            + ["`max_concurrent`"],
+            ["OS + daemons"] + [f"{rcases[k]['os_gb']:.0f} GB" for k in rkeys] + ["fixed"],
+            ["CUDA contexts"] + [f"{rcases[k]['cuda_gb']:.0f} GB" for k in rkeys]
+            + [f"GPU count ({a.gpus_per_node})"],
+            ["Runtime (torch, vLLM, processors)"] + [f"{rcases[k]['runtime_gb']:.0f} GB" for k in rkeys]
+            + ["fixed"],
+            ["Weight-load staging (transient peak)"] + [f"{rcases[k]['stage_gb']:.0f} GB" for k in rkeys]
+            + ["model size"],
+            ["In-flight images"] + [f"{rcases[k]['request_gb']:.2f} GB" for k in rkeys]
+            + [f"concurrency × {ram['images_per_request']} image(s) × resolution"],
+            ["Weight page cache"] + [f"{rcases[k]['cache_gb']:.0f} GB" for k in rkeys]
+            + ["models you want warm"],
+            ["**Total working set**"] + [f"**{rcases[k]['total_gb']:.0f} GB**" for k in rkeys] + [""],
+            ["**Provision**"] + [f"**{rcases[k]['recommended_gb']} GB**" for k in rkeys]
+            + ["rounded to a buyable DIMM population"],
+        ]))
+    w("")
+    if ram["measured_mean_gb"] > 0:
+        w(f"Measured during this run: **{ram['measured_mean_gb']:.1f} GB mean, "
+          f"{ram['measured_peak_gb']:.1f} GB peak**"
+          + (f", against {ram['installed_gb']:.0f} GB installed."
+             if ram["installed_gb"] else ".")
+          + " That reading is against `max_concurrent: 2`, so treat it as the Low column "
+            "and not as evidence that the Expected column is over-built.")
         w("")
+    w(f"### Recommendation: provision **{rcases[rkeys[1]]['recommended_gb']} GB** per node, "
+      f"**{rcases[rkeys[2]]['recommended_gb']} GB** if both VLMs must stay warm")
+    w("")
+    w(f"The Expected column ({rcases[rkeys[1]]['recommended_gb']} GB) covers "
+      f"`max_concurrent: 16` with the active VLM's "
+      f"{ram['active_model_gb']} GB of weights held in page cache, which is what keeps a "
+      f"model swap off the critical path. The High column "
+      f"({rcases[rkeys[2]]['recommended_gb']} GB) additionally keeps both VLMs cached, so "
+      f"the `EVICT_GROUPS` swap between `qwen3-vl` and `internvl` re-reads from page cache "
+      f"rather than from disk. Given the GPU spend, the step from "
+      f"{rcases[rkeys[1]]['recommended_gb']} to {rcases[rkeys[2]]['recommended_gb']} GB is "
+      f"marginal and worth taking.")
+    w("")
 
     # ── 9. Method & caveats ─────────────────────────────────────────────────
-    w("## 9. Method, reproduction, and caveats")
+    w("## 10. Method, reproduction, and caveats")
     w("")
     w("```bash")
     w("# on the GPU box")
@@ -1052,7 +1430,24 @@ def main() -> None:
                     help="added to GPU-box timestamps to align with the load generator")
     ap.add_argument("--max-concurrent", type=int, default=2,
                     help="the GPU server's max_concurrent for this model, for the charts")
-    ap.add_argument("--retention-days", type=float, default=90.0)
+    ap.add_argument("--gpus-per-node", type=int, default=2,
+                    help="GPUs in the sourcing unit — 2 for an H200 NVL pair")
+    ap.add_argument("--retention-days", type=float, default=30.0,
+                    help="how long raw images are kept")
+    ap.add_argument("--image-kb-low",  type=float, default=150.0,
+                    help="Low case: well-compressed JPEG page")
+    ap.add_argument("--image-kb-high", type=float, default=800.0,
+                    help="High case: high-DPI or lossless scans")
+    ap.add_argument("--images-per-request", type=int, default=1,
+                    help="images per inference call; drives in-flight host RAM")
+    ap.add_argument("--replica-factor",  type=float, default=2.0,
+                    help="copies kept of pipeline data (primary + backup)")
+    ap.add_argument("--fs-high-water",   type=float, default=0.80,
+                    help="highest filesystem fill you will plan to")
+    ap.add_argument("--growth-headroom", type=float, default=1.5,
+                    help="multiplier for volume growth over the planning horizon")
+    ap.add_argument("--ram-installed-gb", type=float, default=0.0,
+                    help="override the sampler's reading of installed host RAM")
     ap.add_argument("--cost-gpu-hour",  type=float, default=3.50)
     ap.add_argument("--power-cost-kwh", type=float, default=0.12)
     ap.add_argument("--pue",            type=float, default=1.4)
@@ -1138,7 +1533,7 @@ def main() -> None:
             "scenario_rate": rate,
             "daily_images_at_rate": rate * args.window_hours * 3600.0,
             "nodes_required": nodes,
-            "gpus_required": nodes * 2,
+            "gpus_required": nodes * args.gpus_per_node,
         })
 
     # ── power & economics ────────────────────────────────────────────────────
@@ -1157,7 +1552,8 @@ def main() -> None:
 
     busy_hours   = args.daily_images / sustained / 3600.0 if sustained else 0.0
     duty_cycle   = busy_hours / args.window_hours if args.window_hours else 0.0
-    n_gpus       = max(1, len(phase_gpu.get(idle_before_key, {}).get("gpus", {}) or {1: 1}))
+    n_gpus       = max(1, len(phase_gpu.get(idle_before_key, {}).get("gpus", {}))
+                       or args.gpus_per_node)
     gpu_hours_pd = busy_hours * n_gpus
 
     kwh_per_day      = args.daily_images * wh_per_image / 1000.0
@@ -1179,33 +1575,18 @@ def main() -> None:
         "power_cost_per_image": power_cost_day / args.daily_images if args.daily_images else 0.0,
     }
 
-    # ── storage ──────────────────────────────────────────────────────────────
-    avg_kb    = float(meta.get("corpus_avg_kb", 0) or 0)
-    daily_gb  = args.daily_images * avg_kb / 1e6
-    host_any  = next((h for h in phase_host.values() if h), {})
-    mean_out  = float(np.mean([s["new_tokens"]["mean"] for s in scenarios])) if scenarios else 0.0
-    json_kb   = mean_out * 4 / 1024.0          # ~4 bytes/token for JSON-ish output
-    free_gb   = host_any.get("disk_free_gb", 0)
+    # ── storage & RAM sizing ─────────────────────────────────────────────────
+    host_any = next((h for h in phase_host.values() if h), {})
+    storage  = compute_storage(args, meta, scenarios, host_any)
+    ram      = compute_ram(args, scenarios, host_any, storage)
 
     vram_load = 0.0
-    for s in scenarios:
-        st = phase_gpu.get(s["scenario"], {})
+    for s_ in scenarios:
+        st = phase_gpu.get(s_["scenario"], {})
         vram_load = max(vram_load, sum(g["mem_used_gb"]["max"] for g in st.get("gpus", {}).values()))
-    vram_total = sum(g["mem_total_gb"] for g in
-                     phase_gpu.get(idle_before_key, {}).get("gpus", {}).values())
-
-    storage = {
-        "daily_gb": daily_gb,
-        "retention_gb": daily_gb * args.retention_days,
-        "json_kb_per_image": json_kb,
-        "json_daily_mb": args.daily_images * json_kb / 1024.0,
-        "models_measured_gb": host_any.get("disk_used_gb", 0),
-        "disk_free_gb": free_gb,
-        "disk_total_gb": host_any.get("disk_total_gb", 0),
-        "disk_path": host_any.get("disk_path", "n/a"),
-        "vram_load_gb": vram_load, "vram_total_gb": vram_total,
-        "disk_runway_days": (free_gb / daily_gb) if daily_gb > 0 else None,
-    }
+    storage["vram_load_gb"]  = vram_load
+    storage["vram_total_gb"] = sum(g["mem_total_gb"] for g in
+                                   phase_gpu.get(idle_before_key, {}).get("gpus", {}).values())
 
     # ── GPU imbalance finding ────────────────────────────────────────────────
     imbalance = ""
@@ -1223,10 +1604,11 @@ def main() -> None:
     t_origin = min(fnum(p, "start_ts") for p in phases)
     charts = {
         "util": "chart_gpu_util.png", "vram": "chart_vram.png",
-        "power": "chart_power.png", "ram": "chart_host_ram.png",
+        "power": "chart_power.png", "host_ram": "chart_host_ram.png",
         "before_after": "chart_before_after.png", "throughput": "chart_throughput.png",
         "latency": "chart_latency.png", "cdf": "chart_latency_cdf.png",
         "concurrency": "chart_concurrency.png", "sizing": "chart_sizing.png",
+        "storage": "chart_storage.png", "ram": "chart_ram.png",
     }
 
     chart_timeline(out / charts["util"], gpu_rows, phases, offset, t_origin,
@@ -1244,7 +1626,7 @@ def main() -> None:
                    "power_w", "board power (W)",
                    "GPU board power — the basis for energy-per-image",
                    "idle draw between phases is the floor cost of keeping the model resident")
-    chart_host_timeline(out / charts["ram"], host_rows, phases, offset, t_origin)
+    chart_host_timeline(out / charts["host_ram"], host_rows, phases, offset, t_origin)
     chart_before_after(out / charts["before_after"], phase_gpu, scenarios,
                        idle_before_key, idle_after_key)
     chart_throughput(out / charts["throughput"], scenarios, req_rate)
@@ -1256,12 +1638,19 @@ def main() -> None:
     chart_concurrency(out / charts["concurrency"], req_rows, phases, t_origin,
                       args.max_concurrent)
     chart_sizing(out / charts["sizing"], sizing)
+    chart_storage(out / charts["storage"], storage, args)
+    chart_ram(out / charts["ram"], ram)
+
+    # A duplicate key here silently overwrites one chart with another and the
+    # report then points at the survivor. Cheap to assert, invisible otherwise.
+    assert len(set(charts.values())) == len(charts), \
+        f"duplicate chart filenames: {sorted(charts.values())}"
 
     ctx = {
         "args": args, "meta": meta, "scenarios": scenarios,
         "phase_gpu": phase_gpu, "phase_host": phase_host,
         "sizing": sizing, "economics": economics, "storage": storage,
-        "charts": charts, "sustained_rate": sustained, "ceiling_rate": ceiling,
+        "ram": ram, "charts": charts, "sustained_rate": sustained, "ceiling_rate": ceiling,
         "nodes_for_daily": nodes_daily, "daily_capacity": daily_capacity,
         "idle_before_key": idle_before_key, "idle_after_key": idle_after_key,
         "gpu_imbalance": imbalance,
@@ -1275,7 +1664,7 @@ def main() -> None:
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "synthetic": ctx["synthetic"],
         "run_meta": meta, "scenarios": scenarios, "sizing": sizing,
-        "economics": economics, "storage": storage,
+        "economics": economics, "storage": storage, "ram": ram,
         "phase_gpu": phase_gpu, "phase_host": phase_host,
         "sustained_rate_img_s": sustained, "ceiling_rate_img_s": ceiling,
         "sustained_is_measured": sustained_is_measured,

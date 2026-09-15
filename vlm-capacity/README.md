@@ -164,6 +164,12 @@ python3 analyze.py --results ./results --out ./report \
 | `--max-inflight` | `400` | Client-side safety cap. Rows shed here are excluded from success rates |
 | `--sla-p95` | `30` s | Drives the SUSTAINABLE verdict. Set it to your actual SLA |
 | `--cost-gpu-hour` | `3.50` | An assumption. Replace with your quote before circulating the report |
+| `--gpus-per-node` | `2` | The sourcing unit — an H200 NVL pair |
+| `--retention-days` | `30` | How long raw images are kept |
+| `--image-kb-low` / `--image-kb-high` | `150` / `800` | The bracket around the measured page size |
+| `--replica-factor` | `2` | Copies of pipeline data (primary + backup) |
+| `--fs-high-water` | `0.80` | Highest filesystem fill you will plan to |
+| `--growth-headroom` | `1.5` | Volume growth over the planning horizon |
 
 ---
 
@@ -190,6 +196,36 @@ offered rate delivered, and p95 within the SLA. `DEGRADED` is ≥80% of offered
 rate with one of those broken. `FAILED` is anything less.
 
 ---
+
+## Sizing assumptions
+
+The report sizes the estate as **one node of 2 × H200 NVL**, and sizes storage
+and RAM three ways — Low / Expected / High — rather than quoting one number.
+
+**Storage.** 24,000 images/day at 30-day retention means 720,000 images resident
+at steady state. Expected uses the measured corpus average; Low and High bracket
+it (and are widened automatically if the measurement falls outside them, so the
+columns stay monotonic). On top of raw images the model counts derived copies,
+extracted JSON sized from **measured** output tokens, and audit logs, then
+applies the replica factor, an 80% filesystem high-water mark, and a growth
+multiplier. The report recommends provisioning against the **High** case: the
+delta is negligible against the GPU spend, and a full image volume stops the
+pipeline outright. Images and model weights are sized as **separate volumes** —
+weights are a fixed ~260 GB read at load time, images are an unbounded
+append-and-expire stream, and sharing one volume lets an ingest backlog prevent
+a model from loading.
+
+**RAM.** Most terms are fixed (OS, CUDA contexts per GPU, runtime, the transient
+peak while weights stream in). The one that scales is the request path: every
+in-flight image is simultaneously a base64 string, a decoded RGB bitmap, and a
+preprocessed tensor. At today's `max_concurrent: 2` that is invisible; at the
+16–32 the report recommends it becomes the largest variable consumer — so
+raising concurrency is a RAM decision as well as a throughput one. The Expected
+case also holds the active VLM's 61 GB of weights in page cache, which is what
+keeps a model swap off the critical path; the High case keeps both VLMs cached
+so the `EVICT_GROUPS` swap re-reads from cache rather than disk.
+
+Every one of these is a flag. Change them and re-run — nothing needs editing.
 
 ## Corpus realism
 
