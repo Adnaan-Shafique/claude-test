@@ -170,6 +170,8 @@ python3 analyze.py --results ./results --out ./report \
 | `--replica-factor` | `2` | Copies of pipeline data (primary + backup) |
 | `--fs-high-water` | `0.80` | Highest filesystem fill you will plan to |
 | `--growth-headroom` | `1.5` | Volume growth over the planning horizon |
+| `--cpu-ms-per-image` | `60` | Host CPU per image for decode/resize/normalise — **measure this** |
+| `--cpu-headroom` | `1.4` | CPU sizing multiplier |
 
 ---
 
@@ -293,6 +295,31 @@ keeps a model swap off the critical path; the High case keeps both VLMs cached
 so the `EVICT_GROUPS` swap re-reads from cache rather than disk.
 
 Every one of these is a flag. Change them and re-run — nothing needs editing.
+
+## The summary table
+
+The report ends (section 11) with one table covering all four scenarios: GPU,
+VRAM, nodes, concurrency, RAM, CPU, network, storage, power, and the measured
+verdict. The **GPU row is fixed** at `2 × H200 NVL` — that is the sourcing unit,
+so what varies across scenarios is how many of that unit are needed, never what
+it contains.
+
+Per-node rows (RAM, CPU, NIC) come out constant across scenarios, and that is
+correct rather than a bug: scaling is horizontal, so every node carries the same
+share and needs the same hardware. What scales is the node count and the
+fleet-wide rows that follow from it.
+
+Two rows deserve scrutiny:
+
+- **Concurrency per node** comes from Little's Law (`L = λ × W`), with `W` taken
+  from the **lowest** offered rate. Service time under saturation is inflated by
+  queueing, so using a saturated scenario's latency would size the fleet off its
+  own congestion.
+- **CPU is the only row with no measurement behind it.** This harness does not
+  profile host CPU per image. The 60 ms/image default is reasonable for JPEG
+  decode plus resize and normalise at this page size, but time a decode loop
+  over your own corpus and re-run with `--cpu-ms-per-image` before quoting it in
+  a purchase order. The report says so in place.
 
 ## Corpus realism
 

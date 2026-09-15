@@ -368,7 +368,6 @@ def compute_ram(args, scenarios: list[dict], host: dict, storage: dict) -> dict:
     # Per in-flight image, host-side:
     #   base64 payload ~1.37x the file, decoded RGB up to 2048x2048x3 = 12.6 MB,
     #   preprocessed tensor and transient copies on top.
-    per_image_mb = {"Low": 12.0, "Expected": 28.0, "High": 55.0}
     images_per_req = int(args.images_per_request)
     active_model_gb = MODEL_WEIGHT_GB["Qwen3-VL-30B-A3B"]
 
@@ -378,31 +377,41 @@ def compute_ram(args, scenarios: list[dict], host: dict, storage: dict) -> dict:
         ("Expected (max_concurrent 16)",       16,                   1.0),
         ("High (max_concurrent 32 + both VLMs cached)", 32,          2.2),
     ):
-        os_gb      = 8.0
-        # One CUDA context plus NCCL and allocator overhead per GPU.
-        cuda_gb    = 6.0 * args.gpus_per_node
-        runtime_gb = 10.0                       # torch, vLLM, tokenizers, processors
-        stage_gb   = 16.0                       # transient peak while streaming weights in
-        req_gb     = concurrency * images_per_req * per_image_mb[
-            "Low" if concurrency <= 2 else ("Expected" if concurrency <= 16 else "High")
-        ] / 1024.0
-        # Page cache is not required for correctness, but without it every model
-        # swap re-reads tens of GB from disk inside a request's latency budget.
-        cache_gb   = active_model_gb * cache_frac
-
-        working = os_gb + cuda_gb + runtime_gb + stage_gb + req_gb
-        total   = working + cache_gb
-        cases[label] = {
-            "concurrency": concurrency, "os_gb": os_gb, "cuda_gb": cuda_gb,
-            "runtime_gb": runtime_gb, "stage_gb": stage_gb, "request_gb": req_gb,
-            "cache_gb": cache_gb, "working_gb": working, "total_gb": total,
-            "recommended_gb": _round_to_dimm(total),
-        }
+        cases[label] = _ram_components(args, concurrency, images_per_req,
+                                       active_model_gb * cache_frac)
 
     return {
         "measured_mean_gb": measured_gb, "measured_peak_gb": measured_peak,
         "installed_gb": installed_gb, "images_per_request": images_per_req,
         "active_model_gb": active_model_gb, "cases": cases,
+    }
+
+
+def _ram_components(args, concurrency: int, images_per_req: int,
+                    cache_gb: float) -> dict:
+    """Host RAM broken into its terms, for any concurrency.
+
+    Per in-flight image the host holds a base64 string, a decoded RGB bitmap and
+    a preprocessed tensor at once. The per-image figure rises with concurrency
+    because at higher batch sizes more of those stages overlap in time rather
+    than being freed between requests.
+    """
+    per_image_mb = 12.0 if concurrency <= 2 else (28.0 if concurrency <= 16 else 55.0)
+
+    os_gb      = 8.0
+    # One CUDA context plus NCCL and allocator overhead per GPU.
+    cuda_gb    = 6.0 * args.gpus_per_node
+    runtime_gb = 10.0                       # torch, vLLM, tokenizers, processors
+    stage_gb   = 16.0                       # transient peak while streaming weights in
+    req_gb     = concurrency * images_per_req * per_image_mb / 1024.0
+
+    working = os_gb + cuda_gb + runtime_gb + stage_gb + req_gb
+    total   = working + cache_gb
+    return {
+        "concurrency": concurrency, "os_gb": os_gb, "cuda_gb": cuda_gb,
+        "runtime_gb": runtime_gb, "stage_gb": stage_gb, "request_gb": req_gb,
+        "cache_gb": cache_gb, "working_gb": working, "total_gb": total,
+        "recommended_gb": _round_to_dimm(total),
     }
 
 
@@ -412,6 +421,81 @@ def _round_to_dimm(gb: float) -> int:
         if gb <= step:
             return step
     return int(math.ceil(gb / 1024.0) * 1024)
+
+
+
+def compute_resource_matrix(args, scenarios: list[dict], sustained: float,
+                            storage: dict, economics: dict, vram_peak_gb: float) -> list[dict]:
+    """Per-scenario resource requirement, with the GPU held fixed at one node.
+
+    The GPU row is constant by construction: the sourcing unit is a 2x H200 NVL
+    node, so what varies across scenarios is HOW MANY of that same unit are
+    needed, never what the unit contains. Everything else — concurrency, RAM,
+    CPU, storage, network — is then derived from the scenario's rate.
+
+    Concurrency comes from Little's Law: L = lambda x W, where W is the service
+    time measured at the LOWEST offered rate. Service time under saturation is
+    inflated by queueing, so using a saturated scenario's latency here would
+    size the fleet off its own congestion.
+    """
+    base = scenarios[0] if scenarios else None
+    service_s = 0.0
+    if base:
+        service_s = base["gpu_time_s"]["mean"] or base["latency_s"]["mean"]
+    service_s = max(service_s, 1e-6)
+
+    # Provisioned storage per resident image, taken from the High case in
+    # section 8 so the two tables cannot disagree.
+    high = storage["cases"]["High"]
+    gb_per_resident_image = (high["provisioned_gb"] / storage["resident_images"]
+                             if storage["resident_images"] else 0.0)
+
+    avg_kb = float(storage.get("measured_corpus_kb") or 0) or 250.0
+    images_per_req = int(args.images_per_request)
+
+    rows = []
+    for sc in scenarios:
+        rate  = sc["target_rate"]
+        nodes = max(1, math.ceil(rate / sustained)) if sustained > 0 else 1
+        rate_per_node = rate / nodes
+
+        concurrency = max(1, int(math.ceil(rate_per_node * service_s)))
+        ram = _ram_components(args, concurrency, images_per_req,
+                              MODEL_WEIGHT_GB["Qwen3-VL-30B-A3B"])
+
+        # CPU: image decode and preprocessing is the term that scales. The rest
+        # is the engine's own threads, the API server and the OS.
+        cores_ingest = rate_per_node * (args.cpu_ms_per_image / 1000.0)
+        cores_engine = 2.0 * args.gpus_per_node
+        cores_api    = 2.0
+        cores_os     = 2.0
+        cores_raw    = cores_ingest + cores_engine + cores_api + cores_os
+        cores        = int(math.ceil(cores_raw * args.cpu_headroom / 2.0) * 2)
+
+        daily_at_rate = rate * args.window_hours * 3600.0
+        resident      = daily_at_rate * args.retention_days
+        storage_gb    = resident * gb_per_resident_image
+
+        # base64 inflates the payload by ~4/3 on the wire.
+        mbps = rate_per_node * avg_kb * 1024 * 1.37 * 8 / 1e6
+
+        rows.append({
+            "rate": rate, "nodes": nodes, "gpus_total": nodes * args.gpus_per_node,
+            "rate_per_node": rate_per_node, "service_s": service_s,
+            "concurrency": concurrency,
+            "ram_gb": ram["recommended_gb"], "ram_working_gb": ram["total_gb"],
+            "cpu_cores": cores, "cpu_raw": cores_raw, "cores_ingest": cores_ingest,
+            "daily_images": daily_at_rate, "resident_images": resident,
+            "storage_gb": storage_gb, "storage_tb": storage_gb / 1000.0,
+            "daily_ingest_gb": daily_at_rate * avg_kb / 1e6,
+            "network_mbps": mbps,
+            "vram_per_node_gb": vram_peak_gb,
+            "power_w": economics["load_power_w"] * nodes,
+            "node_power_w": economics["node_power_w"] * nodes,
+            "verdict": sc["verdict"],
+            "meets_on_one_node": nodes <= 1,
+        })
+    return rows
 
 
 # ═══════════════════════════════ charts ═══════════════════════════════════════
@@ -1407,6 +1491,111 @@ def build_report(ctx: dict, out: Path) -> str:
       f"joined on wall-clock time with a {a.clock_offset_s:+.1f}s offset. Verify NTP sync "
       f"before trusting phase-aligned GPU statistics.")
     w("")
+    # ── 11. Resource requirement summary ────────────────────────────────────
+    mx   = ctx["matrix"]
+    stor = ctx["storage"]
+    w("## 11. Resource requirement summary")
+    w("")
+    w(f"One table, all four scenarios. The **GPU row is fixed by design** — the "
+      f"sourcing unit is a {a.gpus_per_node}× H200 NVL node, so what changes across "
+      f"scenarios is how many of that same unit are needed, never what the unit "
+      f"contains. Every other row is derived from the scenario's rate.")
+    w("")
+
+    cols = [f"{r['rate']:g} img/s" for r in mx]
+    hdr  = ["Resource (per node unless stated)"] + cols
+
+    rows = [
+        ["**GPU**", *[f"**{a.gpus_per_node} × H200 NVL**" for _ in mx]],
+        ["VRAM installed", *[f"{stor['vram_total_gb']:.0f} GB" for _ in mx]],
+        ["VRAM in use (peak measured)", *[f"{r['vram_per_node_gb']:.0f} GB" for r in mx]],
+        ["", *["" for _ in mx]],
+        ["**Nodes required**", *[f"**{r['nodes']}**" for r in mx]],
+        ["Total GPUs across the fleet", *[f"{r['gpus_total']} × H200" for r in mx]],
+        ["Rate carried per node", *[f"{r['rate_per_node']:.2f} img/s" for r in mx]],
+        ["Concurrency per node (`max_concurrent`)", *[f"≥ {r['concurrency']}" for r in mx]],
+        ["", *["" for _ in mx]],
+        ["**Host RAM**", *[f"**{r['ram_gb']} GB**" for r in mx]],
+        ["— working set before rounding", *[f"{r['ram_working_gb']:.0f} GB" for r in mx]],
+        ["**CPU**", *[f"**{r['cpu_cores']} cores**" for r in mx]],
+        ["— of which image decode/preprocess", *[f"{r['cores_ingest']:.1f} cores" for r in mx]],
+        ["**Network (ingest)**", *[f"{r['network_mbps']:,.0f} Mbps" for r in mx]],
+        ["— NIC recommended",
+         *[("1 GbE" if r["network_mbps"] < 300 else
+            "10 GbE" if r["network_mbps"] < 3000 else "25 GbE") for r in mx]],
+        ["", *["" for _ in mx]],
+        ["Images/day at this rate", *[f"{r['daily_images']:,.0f}" for r in mx]],
+        ["Images resident "
+         f"({a.retention_days:g}-day retention)", *[f"{r['resident_images']:,.0f}" for r in mx]],
+        ["**Storage provisioned (fleet)**",
+         *[(f"**{r['storage_tb']:.1f} TB**" if r["storage_tb"] >= 1
+            else f"**{r['storage_gb']:,.0f} GB**") for r in mx]],
+        ["— daily ingest", *[f"{r['daily_ingest_gb']:,.0f} GB/day" for r in mx]],
+        ["Model-weight volume (per node)",
+         *[f"{stor['registry_models_gb']:,.0f} GB" for _ in mx]],
+        ["", *["" for _ in mx]],
+        ["GPU board power (fleet)", *[f"{r['power_w']:,.0f} W" for r in mx]],
+        ["Node power incl. PUE (fleet)", *[f"{r['node_power_w']:,.0f} W" for r in mx]],
+        ["", *["" for _ in mx]],
+        ["**Measured verdict**",
+         *[f"{STATUS_ICON[r['verdict']]} {r['verdict'].title()}" for r in mx]],
+        ["Fits on the current single node?",
+         *[("✔ yes" if r["meets_on_one_node"] else
+            f"✖ needs {r['nodes']} nodes") for r in mx]],
+    ]
+    w(md_table(hdr, rows))
+    w("")
+    per_node_constant = len({r["ram_gb"] for r in mx}) == 1
+    if per_node_constant and len({r["nodes"] for r in mx}) > 1:
+        w("**Why the per-node rows do not change.** Scaling here is horizontal: each "
+          "node carries the same share of the load, so its RAM, CPU and NIC "
+          "requirements are identical whether the fleet is one node or fifteen. What "
+          "scales with the scenario is the **node count**, and the fleet-wide rows "
+          "that follow from it — storage, power, and total GPUs. Size one node once, "
+          "then multiply.")
+        w("")
+    if sustained > 0 and any(r["nodes"] > 1 for r in mx):
+        w(f"> **Read the node counts as a ceiling, not a purchase order.** They divide "
+          f"by the {sustained:.2f} img/s this configuration sustained, and section 6 "
+          f"argues that figure is set by `max_concurrent: 2` rather than by the "
+          f"hardware. If raising it recovers even a fraction of the available batching, "
+          f"every node count above falls proportionally. Re-run this report after that "
+          f"change before sourcing against these numbers.")
+        w("")
+    w("### How each row was derived")
+    w("")
+    w(md_table(["Row", "Basis"], [
+        ["GPU", f"Fixed: {a.gpus_per_node} × H200 NVL is the sourcing unit"],
+        ["VRAM in use", "**Measured** peak across both cards under load"],
+        ["Nodes required", f"`ceil(rate ÷ {sustained:.3f})` using the sustained per-node rate"],
+        ["Concurrency per node",
+         f"Little's Law: `L = λ × W`, with W = {mx[0]['service_s']:.2f}s — the "
+         f"**measured** service time at the lowest offered rate, before queueing "
+         f"inflates it"],
+        ["Host RAM",
+         "Fixed terms (OS, CUDA contexts, runtime, load staging) + concurrency × "
+         "in-flight image cost + the active VLM's weights in page cache, rounded up "
+         "to a buyable DIMM population"],
+        ["CPU",
+         f"`{a.cpu_ms_per_image:g} ms/image` decode+preprocess × rate, plus "
+         f"{2 * a.gpus_per_node:.0f} engine cores, 2 API, 2 OS, × {a.cpu_headroom:g} "
+         f"headroom, rounded up to an even count"],
+        ["Network", "rate × measured page size × 1.37 (base64 overhead) × 8"],
+        ["Storage",
+         f"Scenario's daily volume × {a.retention_days:g} days, at the section 8 "
+         f"**High** per-image provisioned rate (includes replicas, 80% high-water "
+         f"and growth)"],
+        ["Power", "**Measured** board power under load × node count"],
+    ]))
+    w("")
+    w("> **The one row to argue with is CPU.** It is the only line here with no "
+      "measurement behind it — this harness does not profile host CPU per image. "
+      f"The {a.cpu_ms_per_image:g} ms/image assumption is a reasonable figure for "
+      f"JPEG decode plus resize and normalise at this page size, but measure it on "
+      f"your own documents (`time` a decode loop over the corpus) and re-run with "
+      f"`--cpu-ms-per-image` before quoting the row in a purchase order.")
+    w("")
+
     w("---")
     w("")
     w(f"*Charts and the full numeric dump are in `{out.name}/`. Every figure in this "
@@ -1446,6 +1635,10 @@ def main() -> None:
                     help="highest filesystem fill you will plan to")
     ap.add_argument("--growth-headroom", type=float, default=1.5,
                     help="multiplier for volume growth over the planning horizon")
+    ap.add_argument("--cpu-ms-per-image", type=float, default=60.0,
+                    help="host CPU per image for decode, resize and normalise")
+    ap.add_argument("--cpu-headroom", type=float, default=1.4,
+                    help="CPU sizing multiplier — never size a host to 100%%")
     ap.add_argument("--ram-installed-gb", type=float, default=0.0,
                     help="override the sampler's reading of installed host RAM")
     ap.add_argument("--cost-gpu-hour",  type=float, default=3.50)
@@ -1659,12 +1852,16 @@ def main() -> None:
         "synthetic": bool(meta.get("mock_detected")),
     }
 
+    ctx["matrix"] = compute_resource_matrix(args, scenarios, sustained, storage,
+                                            economics, storage["vram_load_gb"])
+
     (out / "REPORT.md").write_text(build_report(ctx, out))
     (out / "summary.json").write_text(json.dumps({
         "generated_utc": datetime.now(timezone.utc).isoformat(),
         "synthetic": ctx["synthetic"],
         "run_meta": meta, "scenarios": scenarios, "sizing": sizing,
         "economics": economics, "storage": storage, "ram": ram,
+        "resource_matrix": ctx["matrix"],
         "phase_gpu": phase_gpu, "phase_host": phase_host,
         "sustained_rate_img_s": sustained, "ceiling_rate_img_s": ceiling,
         "sustained_is_measured": sustained_is_measured,
