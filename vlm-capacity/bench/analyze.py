@@ -472,9 +472,18 @@ def compute_resource_matrix(args, scenarios: list[dict], sustained: float,
         cores_raw    = cores_ingest + cores_engine + cores_api + cores_os
         cores        = int(math.ceil(cores_raw * args.cpu_headroom / 2.0) * 2)
 
-        daily_at_rate = rate * args.window_hours * 3600.0
-        resident      = daily_at_rate * args.retention_days
-        storage_gb    = resident * gb_per_resident_image
+        # Storage is CUMULATIVE, so it is driven by the committed daily volume
+        # and retention — never by the arrival rate. The 10/20/30 img/s
+        # scenarios describe how fast the same 24,000 images arrive, not how
+        # many there are: at 10 img/s the day's work is done in 40 minutes.
+        # Scaling storage by rate would have claimed 360,000 images/day.
+        resident   = args.daily_images * args.retention_days
+        storage_gb = resident * gb_per_resident_image
+
+        # What the rate actually changes is how long the fleet is busy.
+        clear_s     = args.daily_images / rate if rate > 0 else 0.0
+        window_s    = args.window_hours * 3600.0
+        duty        = clear_s / window_s if window_s else 0.0
 
         # base64 inflates the payload by ~4/3 on the wire.
         mbps = rate_per_node * avg_kb * 1024 * 1.37 * 8 / 1e6
@@ -485,9 +494,10 @@ def compute_resource_matrix(args, scenarios: list[dict], sustained: float,
             "concurrency": concurrency,
             "ram_gb": ram["recommended_gb"], "ram_working_gb": ram["total_gb"],
             "cpu_cores": cores, "cpu_raw": cores_raw, "cores_ingest": cores_ingest,
-            "daily_images": daily_at_rate, "resident_images": resident,
+            "daily_images": args.daily_images, "resident_images": resident,
             "storage_gb": storage_gb, "storage_tb": storage_gb / 1000.0,
-            "daily_ingest_gb": daily_at_rate * avg_kb / 1e6,
+            "daily_ingest_gb": args.daily_images * avg_kb / 1e6,
+            "clear_s": clear_s, "clear_h": clear_s / 3600.0, "duty_cycle": duty,
             "network_mbps": mbps,
             "vram_per_node_gb": vram_peak_gb,
             "power_w": economics["load_power_w"] * nodes,
@@ -1524,9 +1534,14 @@ def build_report(ctx: dict, out: Path) -> str:
          *[("1 GbE" if r["network_mbps"] < 300 else
             "10 GbE" if r["network_mbps"] < 3000 else "25 GbE") for r in mx]],
         ["", *["" for _ in mx]],
-        ["Images/day at this rate", *[f"{r['daily_images']:,.0f}" for r in mx]],
-        ["Images resident "
-         f"({a.retention_days:g}-day retention)", *[f"{r['resident_images']:,.0f}" for r in mx]],
+        ["Committed daily volume", *[f"{r['daily_images']:,.0f} images" for r in mx]],
+        ["Time to clear it at this rate",
+         *[(f"{r['clear_h']:.1f} h" if r["clear_h"] >= 1
+            else f"{r['clear_s'] / 60:.0f} min") for r in mx]],
+        [f"Fleet busy fraction of the {a.window_hours:g} h window",
+         *[f"{r['duty_cycle'] * 100:.0f}%" for r in mx]],
+        [f"Images resident ({a.retention_days:g}-day retention)",
+         *[f"{r['resident_images']:,.0f}" for r in mx]],
         ["**Storage provisioned (fleet)**",
          *[(f"**{r['storage_tb']:.1f} TB**" if r["storage_tb"] >= 1
             else f"**{r['storage_gb']:,.0f} GB**") for r in mx]],
@@ -1534,8 +1549,11 @@ def build_report(ctx: dict, out: Path) -> str:
         ["Model-weight volume (per node)",
          *[f"{stor['registry_models_gb']:,.0f} GB" for _ in mx]],
         ["", *["" for _ in mx]],
-        ["GPU board power (fleet)", *[f"{r['power_w']:,.0f} W" for r in mx]],
-        ["Node power incl. PUE (fleet)", *[f"{r['node_power_w']:,.0f} W" for r in mx]],
+        ["GPU board power — peak draw (fleet)", *[f"{r['power_w']:,.0f} W" for r in mx]],
+        ["Node power incl. PUE — peak draw (fleet)",
+         *[f"{r['node_power_w']:,.0f} W" for r in mx]],
+        ["Energy per day (work is the same in every scenario)",
+         *[f"{econ['node_kwh_per_day']:,.1f} kWh" for _ in mx]],
         ["", *["" for _ in mx]],
         ["**Measured verdict**",
          *[f"{STATUS_ICON[r['verdict']]} {r['verdict'].title()}" for r in mx]],
@@ -1545,6 +1563,33 @@ def build_report(ctx: dict, out: Path) -> str:
     ]
     w(md_table(hdr, rows))
     w("")
+    w("**Why storage does not change across the scenarios.** Storage is cumulative: "
+      f"it is set by the committed volume of {a.daily_images:,} images/day and the "
+      f"{a.retention_days:g}-day retention, both of which are fixed business inputs. "
+      f"The scenarios describe how *fast* that same day's work arrives, not how much "
+      f"of it there is — at 10 img/s the day is cleared in "
+      f"{a.daily_images / 10 / 60:.0f} minutes rather than "
+      f"{a.window_hours:g} hours. A faster pipeline does not create more images, so "
+      f"the image store is the same size in every column. The same logic applies to "
+      f"energy per day: the same work is done either way, just compressed into a "
+      f"shorter window at a higher instantaneous draw.")
+    w("")
+    idle_heavy = [r for r in mx if r["nodes"] > 1 and r["duty_cycle"] < 0.25]
+    if idle_heavy:
+        worst = max(idle_heavy, key=lambda r: r["nodes"])
+        w(f"> **The duty-cycle row is the most important line in this table.** Sizing "
+          f"for {worst['rate']:g} img/s means buying **{worst['nodes']} nodes "
+          f"({worst['gpus_total']} H200s)** that sit idle "
+          f"**{(1 - worst['duty_cycle']) * 100:.0f}%** of the working window — the "
+          f"committed volume is cleared in "
+          f"{worst['clear_s'] / 60:.0f} minutes and the fleet then has nothing to do. "
+          f"Before sourcing against any of the high-rate columns, establish whether "
+          f"the burst requirement is real: a genuine intake spike (a nightly batch "
+          f"drop, an SLA on same-minute turnaround) justifies it, while 'faster is "
+          f"better' does not. If the volume can be queued and drained across the "
+          f"window instead, the {mx[0]['rate']:g} img/s column is the one to source "
+          f"against, and the rest is capacity you would be paying to keep idle.")
+        w("")
     per_node_constant = len({r["ram_gb"] for r in mx}) == 1
     if per_node_constant and len({r["nodes"] for r in mx}) > 1:
         w("**Why the per-node rows do not change.** Scaling here is horizontal: each "
@@ -1581,11 +1626,16 @@ def build_report(ctx: dict, out: Path) -> str:
          f"{2 * a.gpus_per_node:.0f} engine cores, 2 API, 2 OS, × {a.cpu_headroom:g} "
          f"headroom, rounded up to an even count"],
         ["Network", "rate × measured page size × 1.37 (base64 overhead) × 8"],
+        ["Committed daily volume", "Fixed business input — identical in every scenario"],
+        ["Time to clear / busy fraction", "`daily volume ÷ rate`, against the "
+                                          f"{a.window_hours:g} h window"],
         ["Storage",
-         f"Scenario's daily volume × {a.retention_days:g} days, at the section 8 "
-         f"**High** per-image provisioned rate (includes replicas, 80% high-water "
-         f"and growth)"],
-        ["Power", "**Measured** board power under load × node count"],
+         f"`{a.daily_images:,} images/day × {a.retention_days:g} days` at the section 8 "
+         f"**High** per-image provisioned rate (includes replicas, 80% high-water and "
+         f"growth). **Independent of the rate** — see the note above the table"],
+        ["Power (peak draw)", "**Measured** board power under load × node count"],
+        ["Energy per day", "Fixed work ÷ measured energy per image — the same in "
+                           "every scenario"],
     ]))
     w("")
     w("> **The one row to argue with is CPU.** It is the only line here with no "
