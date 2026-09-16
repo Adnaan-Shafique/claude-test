@@ -103,20 +103,96 @@ check("and the reason is the model's own words",
       rec.quality.failure_reasons == ["Badly blurred."], str(rec.quality.failure_reasons))
 check("unknown presence survives", rec.detection.presence == "unknown")
 
+print("\nmode 3 renders the photograph it judged")
+import tempfile  # noqa: E402
+_written = []
+# A real file on disk: image_or_placeholder checks existence before emitting an
+# <img>, so a purely in-memory fake would silently exercise the placeholder path.
+sys.modules["cv2"].imwrite = lambda path, img: (_written.append(path),
+                                                Path(path).write_bytes(b"jpg"), True)[2]
+tmp = Path(tempfile.mkdtemp()) / "plain" / "a.jpg"
+rec_img = M._vlm_only_record(Path("/p/a.jpg"), "a", "hazard_warning", combined,
+                             quality(True), 0.0, image_bgr=object(), image_path=tmp)
+check("the plain copy is written and recorded",
+      rec_img.quality.annotated_path == str(tmp), str(rec_img.quality.annotated_path))
+check("its folder is created", tmp.parent.is_dir())
+check("mode 3 draws no box on the detection panel",
+      rec_img.detection.annotated_path is None)
+sys.modules["cv2"].imwrite = lambda path, img: False
+rec_fail = M._vlm_only_record(Path("/p/a.jpg"), "a", "hazard_warning", combined,
+                              quality(True), 0.0, image_bgr=object(), image_path=tmp)
+check("a failed write leaves the path empty rather than lying",
+      rec_fail.quality.annotated_path is None)
+
 print("\nmode 3 never fabricates on a mock or a parse failure")
-from pipeline.stage3_vlm import mock_combined, parse_combined  # noqa: E402
-mock = mock_combined(q, "qwen3-vl")
+from pipeline.stage3_vlm import (mock_vlm_only, parse_quality,  # noqa: E402
+                                 parse_presence)
+mock = mock_vlm_only(q, "qwen3-vl")
 check("mock quality is poor, not good", mock["quality"] == "poor")
 check("mock presence is unknown", mock["subject_present"] == "unknown")
 check("mock answer is unknown", mock["answer"] == "unknown")
 check("mock is labelled", mock["is_mock"] is True and "MOCK" in mock["quality_reasoning"])
-empty = parse_combined("")
-check("an empty response defaults to poor/unknown/unknown",
-      (empty["quality"], empty["subject_present"], empty["answer"])
-      == ("poor", "unknown", "unknown"))
-prose = parse_combined("This photograph shows a cabinet in a compound.")
-check("prose with no keys does not invent a verdict",
-      (prose["quality"], prose["subject_present"]) == ("poor", "unknown"))
+check("an empty quality response defaults to poor", parse_quality("")[0] == "poor")
+check("an empty presence response defaults to unknown",
+      parse_presence("")[0] == "unknown")
+check("prose with no keys does not invent a quality verdict",
+      parse_quality("This photograph shows a cabinet in a compound.")[0] == "poor")
+check("prose with no keys does not invent a presence verdict",
+      parse_presence("This photograph shows a cabinet in a compound.")[0] == "unknown")
+
+print("\nper-leg prompts")
+from pipeline.questions import (LEGS, LEG_ANSWER, LEG_PRESENCE,  # noqa: E402
+                                LEG_QUALITY, default_leg_system, render_leg_user)
+check("there are exactly three legs", list(LEGS) == [LEG_QUALITY, LEG_PRESENCE,
+                                                    LEG_ANSWER], str(LEGS))
+check("each leg has a non-empty system prompt",
+      all(default_leg_system(q, leg).strip() for leg in LEGS))
+check("the answer leg uses the question's own system prompt",
+      default_leg_system(q, LEG_ANSWER) == q.system_prompt)
+from pipeline.questions import SUBJECTS  # noqa: E402
+subject = SUBJECTS[q.id]
+check("the quality leg is generic - it never names the subject",
+      subject.lower() not in default_leg_system(q, LEG_QUALITY).lower(),
+      default_leg_system(q, LEG_QUALITY)[:160])
+check("the presence leg does name the subject",
+      subject.lower() in render_leg_user(q, LEG_PRESENCE).lower(),
+      render_leg_user(q, LEG_PRESENCE)[:160])
+check("every leg's user prompt asks for its own key",
+      all(k in render_leg_user(q, leg) for leg, k in
+          ((LEG_QUALITY, "quality"), (LEG_PRESENCE, "present"),
+           (LEG_ANSWER, "answer"))))
+check("and asks for JSON only, so the parser has something to key on",
+      all("JSON only" in render_leg_user(q, leg) for leg in LEGS))
+
+print("\nprompt store")
+from pipeline.prompts import PromptStore  # noqa: E402
+store_path = Path(tempfile.mkdtemp()) / "prompts.yaml"
+store = PromptStore(store_path)
+check("an untouched leg returns the built-in prompt",
+      store.get(q.id, LEG_QUALITY) == default_leg_system(q, LEG_QUALITY))
+check("and is not reported as overridden",
+      store.is_overridden(q.id, LEG_QUALITY) is False)
+store.set(q.id, LEG_QUALITY, "Judge only sharpness.")
+check("an edit is returned back", store.get(q.id, LEG_QUALITY) == "Judge only sharpness.")
+check("and is reported as overridden", store.is_overridden(q.id, LEG_QUALITY) is True)
+check("other legs are untouched",
+      store.get(q.id, LEG_ANSWER) == default_leg_system(q, LEG_ANSWER))
+check("saving succeeds", store.save() is None and store_path.exists())
+reloaded = PromptStore(store_path)
+check("the edit survives a reload",
+      reloaded.get(q.id, LEG_QUALITY) == "Judge only sharpness.")
+check("and nothing else was written",
+      reloaded.is_overridden(q.id, LEG_ANSWER) is False)
+reloaded.set(q.id, LEG_QUALITY, default_leg_system(q, LEG_QUALITY))
+check("text equal to the default clears the override",
+      reloaded.is_overridden(q.id, LEG_QUALITY) is False)
+reloaded.save()
+check("and an empty store removes the file entirely", not store_path.exists())
+store_path.write_text("{{{ not yaml")
+broken = PromptStore(store_path)
+check("a malformed file degrades to the built-ins rather than crashing",
+      broken.get(q.id, LEG_QUALITY) == default_leg_system(q, LEG_QUALITY))
+check("and says so", bool(broken.load_error), str(broken.load_error))
 
 print("\ncomparison across modes")
 def record(stem, answer, stopped=STOPPED_COMPLETE, mock=False):
@@ -189,8 +265,8 @@ for n in ("Div", "Span", "H1", "H4", "P", "Ul", "Li", "Img", "Pre", "Details",
           "Summary", "Button", "Label", "B", "A"):
     setattr(_html, n, Node)
 _dcc = types.ModuleType("dash.dcc")
-for n in ("Dropdown", "Input", "Upload", "Checklist", "RadioItems", "Tabs", "Tab",
-          "Loading", "Store", "Download"):
+for n in ("Dropdown", "Input", "Textarea", "Upload", "Checklist", "RadioItems",
+          "Tabs", "Tab", "Loading", "Store", "Download"):
     setattr(_dcc, n, Node)
 _dcc.send_file = lambda p: p
 _dt = types.ModuleType("dash.dash_table")
@@ -221,6 +297,7 @@ spec = importlib.util.spec_from_file_location("ui", ROOT / "app" / "demo_dash_mo
 ui = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ui)
 layout_text = ui.layout().text()
+from pipeline.questions import LEG_LABELS as M_LEG_LABELS  # noqa: E402
 
 check("a mode selector exists", "mode" in layout_text)
 check("all three modes are offered",
@@ -242,6 +319,39 @@ rec12 = record("a", "yes")
 panel = ui.detection_column(rec12).text()
 check("modes 1 and 2 still render boxes normally", "2 · Detection" in panel)
 check("with the label and confidence", "0.90" in panel, panel[:200])
+
+check("a prompt editor exists for every leg",
+      all(f"prompt-{leg}" in layout_text for leg in LEGS), layout_text[:0])
+check("the fixed user prompt is shown too",
+      all(f"userprompt-{leg}" in layout_text for leg in LEGS))
+check("each leg is labelled", all(l in layout_text for l in M_LEG_LABELS.values()))
+check("prompts can be saved and reset",
+      "prompt-save" in layout_text and "prompt-reset" in layout_text)
+check("mode 3 can be re-run on its own", "rerun3" in layout_text)
+
+# Mode 3's quality panel: the photograph, the verdict, and no invented number.
+qpanel = ui.quality_column(rec3).text()
+check("mode 3 quality panel renders the image", str(rec3.quality.annotated_path or "")
+      in qpanel or "could not be rendered" in qpanel, qpanel[:160])
+check("and says the model judged it", "judged by the model" in qpanel, qpanel[:200])
+check("and shows no MM-IQA score", "whole frame" not in qpanel, qpanel[:200])
+# thumb() embeds the photograph as a data URI via cv2, so the stub has to be
+# able to decode and re-encode for this assertion to mean anything.
+_cv2 = sys.modules["cv2"]
+_cv2.imread = lambda path: (types.SimpleNamespace(shape=(100, 80, 3))
+                            if Path(path).exists() else None)
+_cv2.imencode = lambda ext, img, params=None: (
+    True, types.SimpleNamespace(tobytes=lambda: b"\xff\xd8jpegbytes"))
+_cv2.IMWRITE_JPEG_QUALITY = 1
+# text() deliberately does not flatten `src`, so reach for the node itself.
+qimg_node = ui.quality_column(rec_img).children[1]
+check("the photograph is embedded as a data URI",
+      str(qimg_node.kw.get("src", "")).startswith("data:image/jpeg;base64,"),
+      str(qimg_node.kw)[:200])
+check("and a missing file falls back to the placeholder, not a broken img",
+      "Image could not be rendered" in ui.quality_column(rec_fail).text())
+check("modes 1 and 2 keep the frozen quality panel",
+      "whole frame" in ui.quality_column(record("a", "yes")).text())
 
 card = ui.result_card(record("a", "yes"), q)
 check("a gate reason is shown when present", True)

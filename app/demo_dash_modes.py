@@ -44,19 +44,24 @@ from dash import Dash, Input, Output, State, dash_table, dcc, html, no_update  #
 from pipeline.config import (SEND_FULL, SEND_FULL_CROP, VLM_MODE_LIVE,  # noqa: E402
                              VLM_MODE_MOCK, default_config)
 from pipeline.modes import (MODE_ORDER, MODE_VLM_ONLY, MODES,  # noqa: E402
-                           agreement, compare_rows, run_all_modes)
+                           agreement, compare_rows, run_all_modes, run_vlm_only)
+from pipeline.prompts import default_store  # noqa: E402
 from pipeline.orchestrator import (collect_images, new_run_id,  # noqa: E402
                                    sort_for_display, summarise)
-from pipeline.questions import QUESTIONS, get_question  # noqa: E402
+from pipeline.questions import (LEG_LABELS, LEGS, QUESTIONS,  # noqa: E402
+                                default_leg_system, get_question, render_leg_user)
 from pipeline.schemas import STOPPED_QUALITY  # noqa: E402
 
 # Shared renderers - see the module docstring on why these are imported.
-# Shared renderers. quality_column and vlm_column are reused verbatim so all
-# three modes look identical; detection_column is re-implemented below because
-# mode 3 reports subject PRESENCE rather than boxes, and app/demo_dash.py is
-# frozen (see FROZEN.md) so it cannot grow that case.
+# Shared renderers. vlm_column is reused verbatim so all three modes look
+# identical; quality_column and detection_column are re-implemented below
+# because mode 3 judges quality in words and reports subject PRESENCE rather
+# than boxes, and app/demo_dash.py is frozen (see FROZEN.md) so it cannot grow
+# those cases. classical_quality_column is the frozen renderer, still used for
+# modes 1 and 2.
 from demo_dash import (FONTS, QUESTION_OPTIONS, FIRST,  # noqa: E402
-                       image_or_placeholder, prompt_text, quality_column,
+                       image_or_placeholder, prompt_text,
+                       quality_column as classical_quality_column,
                        summary_view, tile, vlm_column)
 
 FONT_SHEET = FONTS
@@ -137,6 +142,34 @@ def controls():
             ], className="field"),
             html.Button("Load / check model", id="check", n_clicks=0,
                         className="btn btn-ghost"),
+        ], className="card"),
+
+        html.Div([
+            html.Div("Mode 3 prompts", className="card-title"),
+            html.Div("One system prompt per leg. Each is a separate call, so a "
+                     "change here affects only that judgement.",
+                     className="field-help", style={"marginBottom": "12px"}),
+            html.Div([
+                html.Details([
+                    html.Summary(LEG_LABELS[leg]),
+                    dcc.Textarea(id=f"prompt-{leg}", className="prompt-edit",
+                                 value="", rows=9),
+                    html.Details([
+                        html.Summary("User prompt (fixed — carries the JSON contract)"),
+                        html.Div(id=f"userprompt-{leg}", className="prompt-box"),
+                    ], style={"marginTop": "8px"}),
+                ], className="disclose", open=(leg == LEGS[0]))
+                for leg in LEGS
+            ]),
+            html.Div([
+                html.Button("Save", id="prompt-save", n_clicks=0,
+                            className="btn btn-ghost"),
+                html.Button("Reset to defaults", id="prompt-reset", n_clicks=0,
+                            className="btn btn-ghost"),
+            ], className="btn-row", style={"marginTop": "6px"}),
+            html.Button("Re-run mode 3 only", id="rerun3", n_clicks=0,
+                        className="btn btn-ghost"),
+            html.Div(id="prompt-status", className="field-help"),
         ], className="card"),
 
         html.Div([
@@ -273,7 +306,11 @@ app.layout = layout()
 server = app.server
 
 # {mode_id: [PipelineRecord]} for the last run, so switching modes is instant.
-_RESULTS: dict = {"modes": {}, "question_id": FIRST, "run_dir": None}
+_RESULTS: dict = {"modes": {}, "question_id": FIRST, "run_dir": None,
+                  "paths": [], "cfg": None}
+
+# Mode 3's editable system prompts, loaded from config/prompts.yaml at startup.
+PROMPTS = default_store()
 
 
 @app.callback(Output("semantics", "children"), Output("prompt-view", "children"),
@@ -282,9 +319,60 @@ def on_question(question_id):
     return get_question(question_id).answer_semantics, prompt_text(question_id)
 
 
+@app.callback([Output(f"prompt-{leg}", "value") for leg in LEGS]
+              + [Output(f"userprompt-{leg}", "children") for leg in LEGS]
+              + [Output("prompt-status", "children")],
+              Input("question", "value"))
+def on_question_prompts(question_id):
+    """Load this question's prompts into the editors. Each question has its own
+    set, so switching the dropdown switches the whole pair - the same principle
+    the question registry was built on."""
+    question = get_question(question_id)
+    systems = [PROMPTS.get(question_id, leg) for leg in LEGS]
+    users = [render_leg_user(question, leg) for leg in LEGS]
+    overridden = [LEG_LABELS[leg].split("·")[-1].strip()
+                  for leg in LEGS if PROMPTS.is_overridden(question_id, leg)]
+    if PROMPTS.load_error:
+        status = f"Using built-in prompts — {PROMPTS.load_error}"
+    elif overridden:
+        status = f"Edited: {', '.join(overridden)} (saved to config/prompts.yaml)"
+    else:
+        status = "All three legs are using the built-in prompts."
+    return systems + users + [status]
+
+
 @app.callback(Output("mode-blurb", "children"), Input("mode", "value"))
 def on_mode(mode):
     return MODES[mode]["blurb"]
+
+
+@app.callback(Output("prompt-status", "children", allow_duplicate=True),
+              Input("prompt-save", "n_clicks"), Input("prompt-reset", "n_clicks"),
+              State("question", "value"),
+              *[State(f"prompt-{leg}", "value") for leg in LEGS],
+              prevent_initial_call=True)
+def on_prompt_buttons(save_clicks, reset_clicks, question_id, *values):
+    import dash
+    which = (dash.callback_context.triggered[0]["prop_id"].split(".")[0]
+             if dash.callback_context.triggered else "")
+    if which == "prompt-reset":
+        PROMPTS.reset(question_id)
+        error = PROMPTS.save()
+        return (f"Could not save: {error}" if error else
+                "Reset to the built-in prompts. Reselect the question to reload "
+                "the boxes.")
+    for leg, value in zip(LEGS, values):
+        PROMPTS.set(question_id, leg, value or "")
+    error = PROMPTS.save()
+    if error:
+        return f"Could not save: {error}"
+    changed = [LEG_LABELS[leg].split("·")[-1].strip()
+               for leg in LEGS if PROMPTS.is_overridden(question_id, leg)]
+    if not changed:
+        return ("Saved — all three legs match the built-in prompts, so nothing "
+                "is overridden.")
+    return (f"Saved to config/prompts.yaml. Edited: {', '.join(changed)}. "
+            f"Press \u201cRe-run mode 3 only\u201d to see the effect.")
 
 
 @app.callback(Output("upload-note", "children"), Input("uploads", "filename"))
@@ -380,13 +468,14 @@ def on_run(n_clicks, tab, mode, question_id, folder, upload_contents, upload_nam
                 [html.Span(className="dot dot-warn"), html.Span(source)])
 
     try:
-        by_mode = run_all_modes(paths, question.id, cfg)
+        by_mode = run_all_modes(paths, question.id, cfg, prompts=PROMPTS)
     except Exception as exc:
         return (html.Div([html.Div(f"Run failed: {exc}", className="banner banner-stop"),
                           html.Pre(traceback.format_exc()[-2400:])], className="card"),
                 [html.Span(className="dot dot-bad"), html.Span(f"Run failed: {exc}")])
 
-    _RESULTS.update(modes=by_mode, question_id=question.id, run_dir=cfg.run_dir)
+    _RESULTS.update(modes=by_mode, question_id=question.id, run_dir=cfg.run_dir,
+                    paths=paths, cfg=cfg)
     agree = agreement(by_mode)
     parts = []
     for mode_id in MODE_ORDER:
@@ -399,6 +488,41 @@ def on_run(n_clicks, tab, mode, question_id, folder, upload_contents, upload_nam
                         f"modes · {agree['unanimous']} unanimous, {agree['split']} "
                         f"split · " + "  |  ".join(parts))]
     return _panel(tab, mode, question), status
+
+
+@app.callback(Output("panel", "children", allow_duplicate=True),
+              Output("status", "children", allow_duplicate=True),
+              Input("rerun3", "n_clicks"), State("tabs", "value"),
+              State("mode", "value"), prevent_initial_call=True)
+def on_rerun3(_clicks, tab, mode):
+    """Re-run mode 3 over the same photos with the prompts as they stand now.
+
+    Modes 1 and 2 keep their existing records, so the comparison tab still lines
+    up row for row - only the leg the prompt actually governs is recomputed.
+    """
+    paths, cfg = _RESULTS.get("paths"), _RESULTS.get("cfg")
+    question = get_question(_RESULTS["question_id"])
+    if not paths or cfg is None:
+        return no_update, [html.Span(className="dot dot-warn"),
+                           html.Span("Nothing to re-run yet — run the pipeline first.")]
+
+    # Deliberately the same run id: mode 3's subfolder is rewritten in place so
+    # the run folder keeps describing all three modes as they currently stand,
+    # and the CSV/JSON downloads for modes 1 and 2 keep resolving.
+    try:
+        records = run_vlm_only(paths, question.id, cfg, prompts=PROMPTS)
+    except Exception as exc:
+        return (html.Div([html.Div(f"Re-run failed: {exc}", className="banner banner-stop"),
+                          html.Pre(traceback.format_exc()[-2400:])], className="card"),
+                [html.Span(className="dot dot-bad"), html.Span(f"Re-run failed: {exc}")])
+
+    _RESULTS["modes"][MODE_VLM_ONLY] = records
+    counts = summarise(records)["answers"]
+    tally = ", ".join(f"{k.upper()} {n}" for k, n in sorted(counts.items())) or "none"
+    return (_panel(tab, mode, question),
+            [html.Span(className="dot dot-ok"),
+             html.Span(f"Mode 3 re-run on {len(records)} photo(s) with the current "
+                       f"prompts — {tally}. Modes 1 and 2 are unchanged.")])
 
 
 def _resolve_inputs(folder, upload_contents, upload_names, cfg):
@@ -437,6 +561,40 @@ def _resolve_inputs(folder, upload_contents, upload_names, cfg):
         return paths, note + (f" ({skipped} skipped)" if skipped else "")
 
     return [], "Drop images above, or point at a photo folder on this machine."
+
+
+def quality_column(record):
+    """The quality panel, with mode 3's case.
+
+    Modes 1 and 2 use the frozen renderer unchanged. Mode 3 has no MM-IQA
+    score, so printing the numeric fields would show "whole frame 0.0" - a
+    number the model never produced. It gets the photograph, the verdict and
+    the model's own reasoning instead.
+    """
+    q = record.quality
+    if q.assessed_by != "vlm":
+        return classical_quality_column(record)
+
+    pill = "pill-err" if q.error else "pill-pass" if q.passed else "pill-fail"
+    children = [
+        html.H4("1 · Quality gate"),
+        # The plain, EXIF-corrected photograph: mode 3 never runs u2netp, so
+        # there is no foreground box to draw and claiming one would be a lie.
+        image_or_placeholder(q.annotated_path, "Image could not be rendered"),
+        html.Div(html.Span(q.headline, className=f"pill {pill}"), className="rc-line"),
+    ]
+    if q.width and q.height:
+        children.append(html.Div(f"{q.width}×{q.height} · judged by the model, "
+                                 "no MM-IQA score and no u2netp crop",
+                                 className="rc-muted"))
+    if q.failure_reasons:
+        children.append(html.Div("Model's reasoning: " + " ".join(q.failure_reasons),
+                                 className="rc-line"))
+    elif record.extra.get("quality_reasoning"):
+        children.append(html.Div("Model's reasoning: "
+                                 + record.extra["quality_reasoning"],
+                                 className="rc-line"))
+    return html.Div(children, className="rc-col")
 
 
 def detection_column(record):

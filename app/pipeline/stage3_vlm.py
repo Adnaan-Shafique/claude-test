@@ -36,8 +36,8 @@ from typing import Iterable, Optional
 
 from .config import VLM_MODE_MOCK, SEND_FULL, SEND_FULL_CROP
 from .questions import ANSWER_NO, ANSWER_UNKNOWN, ANSWER_YES, \
-    combined_system_prompt, render_combined_prompt, render_user_prompt, \
-    sampling_for, select_relevant
+    LEG_ANSWER, LEG_PRESENCE, LEG_QUALITY, default_leg_system, render_leg_user, \
+    render_user_prompt, sampling_for, select_relevant
 from .schemas import VLMAnswer
 
 CLIENT_ID = "fieldops-demo-pipeline"
@@ -387,42 +387,95 @@ class VLMClient:
             error=None, is_mock=False,
         )
 
-    def ask_combined(self, image_bgr, question) -> dict:
-        """Mode 3: quality, subject presence and the inspection answer in one
-        call. Never raises - a failure becomes a clearly-labelled mock."""
+    def ask_leg(self, image_bgr, question, leg: str, system: str,
+                image_uri: Optional[str] = None) -> dict:
+        """One leg of mode 3: one system prompt, one question, one answer.
+
+        `system` comes from the prompt store, so an edit in the UI reaches the
+        model without a restart. `image_uri` lets the caller encode the image
+        once and reuse it across all three legs - re-encoding a 2048px JPEG
+        three times per photograph is pure waste.
+        """
         model = self.cfg.vlm_model
-        if self.cfg.vlm_mode == VLM_MODE_MOCK:
-            return mock_combined(question, model)
-
-        error = self.ensure_registry()
-        if error:
-            return mock_combined(question, model, error=f"registry unavailable: {error}")
-
-        system = combined_system_prompt(question)
-        prompt = render_combined_prompt(question)
-        sampling = dict(sampling_for(question, self.cfg))
-        # Three judgements and three reasonings need more room than one answer.
-        sampling["max_new_tokens"] = max(int(sampling["max_new_tokens"]), 420)
+        prompt = render_leg_user(question, leg)
+        sampling = sampling_for(question, self.cfg)
 
         try:
-            uris = [array_to_data_uri(image_bgr)]
-            payload = build_payload(model, prompt, system, uris, sampling, self.registry)
+            uris = [image_uri or array_to_data_uri(image_bgr)]
+            payload = build_payload(model, prompt, system, uris, sampling,
+                                    self.registry)
         except Exception as exc:
-            return mock_combined(question, model, error=describe_error(exc))
+            return {"text": "", "error": describe_error(exc), "elapsed_s": 0.0,
+                    "model": model}
 
         t0 = time.time()
         try:
             response = _post(self.base, "/infer", payload,
                              timeout=self.cfg.request_timeout_s)
         except Exception as exc:
-            return mock_combined(question, model, error=describe_error(exc))
+            return {"text": "", "error": describe_error(exc), "elapsed_s": 0.0,
+                    "model": model}
+        return {"text": response.get("text", "") or "", "error": None,
+                "elapsed_s": float(response.get("elapsed_s") or (time.time() - t0)),
+                "model": response.get("model", model)}
 
-        text = response.get("text", "") or ""
-        result = parse_combined(text)
-        result.update(raw_text=text, model=response.get("model", model),
-                      elapsed_s=float(response.get("elapsed_s") or (time.time() - t0)),
-                      error=None, is_mock=False)
-        return result
+    def ask_vlm_only(self, image_bgr, question, prompts=None) -> dict:
+        """Mode 3: quality, subject presence and the inspection answer, as three
+        separate calls with three separate system prompts.
+
+        Never raises. Any leg that fails degrades the whole result to a
+        clearly-labelled mock rather than reporting two real judgements and one
+        silent default - a partial answer that looks complete is worse than an
+        obvious mock.
+        """
+        model = self.cfg.vlm_model
+        if self.cfg.vlm_mode == VLM_MODE_MOCK:
+            return mock_vlm_only(question, model)
+
+        error = self.ensure_registry()
+        if error:
+            return mock_vlm_only(question, model,
+                                 error=f"registry unavailable: {error}")
+
+        def system_for(leg):
+            if prompts is not None:
+                return prompts.get(question.id, leg)
+            return default_leg_system(question, leg)
+
+        try:
+            image_uri = array_to_data_uri(image_bgr)   # encoded once, used thrice
+        except Exception as exc:
+            return mock_vlm_only(question, model,
+                                 error=f"image encoding failed: {exc}")
+
+        legs = {}
+        for leg in (LEG_QUALITY, LEG_PRESENCE, LEG_ANSWER):
+            legs[leg] = self.ask_leg(image_bgr, question, leg, system_for(leg),
+                                     image_uri=image_uri)
+
+        failed = [leg for leg, r in legs.items() if r["error"]]
+        if failed:
+            first = legs[failed[0]]["error"]
+            return mock_vlm_only(question, model,
+                                 error=f"{', '.join(failed)} leg(s) failed: {first}")
+
+        quality, quality_reasoning = parse_quality(legs[LEG_QUALITY]["text"])
+        presence, presence_reasoning = parse_presence(legs[LEG_PRESENCE]["text"])
+        answer, reasoning = parse_vlm_answer(legs[LEG_ANSWER]["text"])
+
+        return {
+            "quality": quality, "quality_reasoning": quality_reasoning,
+            "subject_present": presence, "subject_reasoning": presence_reasoning,
+            "answer": answer, "reasoning": reasoning,
+            # The answer leg's raw text is what the card's "Raw model output"
+            # accordion shows; every leg's raw text is kept for the record.
+            "raw_text": legs[LEG_ANSWER]["text"],
+            "model": legs[LEG_ANSWER]["model"],
+            "elapsed_s": round(sum(r["elapsed_s"] for r in legs.values()), 3),
+            "error": None, "is_mock": False,
+            "legs": {leg: {"raw": r["text"], "elapsed_s": r["elapsed_s"]}
+                     for leg, r in legs.items()},
+        }
 
     def _images_for(self, image_bgr, question, relevant) -> list[str]:
         """Full image, optionally plus a padded crop of the best relevant box."""
@@ -441,72 +494,81 @@ class VLMClient:
         return uris
 
 
-# ─────────────────────── Mode 3: one call, three judgements ──────────────────
+# ─────────────────── Mode 3: three legs, three calls ─────────────────────────
 
 _QUALITY_RE = re.compile(r'"quality"\s*:\s*"(good|poor)"', re.IGNORECASE)
-_SUBJECT_RE = re.compile(r'"subject_present"\s*:\s*"(yes|no|unknown)"', re.IGNORECASE)
+_PRESENT_RE = re.compile(r'"present"\s*:\s*"(yes|no|unknown)"', re.IGNORECASE)
 
 
-def parse_combined(text: str) -> dict:
-    """Pull all three judgements out of one response.
+def _reasoning_from(raw: str, parsed: Optional[dict]) -> str:
+    if parsed and str(parsed.get("reasoning", "")).strip():
+        return str(parsed["reasoning"]).strip()
+    return raw
 
-    Same descending tolerance as parse_vlm_answer: clean JSON first, then the
-    keys wherever they appear, then an honest fallback. A missing field never
-    fabricates a verdict - quality defaults to "poor" and presence to
-    "unknown", because claiming a photo is good or a subject present on no
-    evidence is the failure that matters here.
-    """
-    raw = (text or "").strip()
-    out = {"quality": "poor", "quality_reasoning": "", "subject_present": ANSWER_UNKNOWN,
-           "subject_reasoning": "", "answer": ANSWER_UNKNOWN, "reasoning": raw}
-    if not raw:
-        out["reasoning"] = ""
-        return out
 
-    stripped = _FENCE.sub("", raw).strip()
+def _loads(text: str) -> Optional[dict]:
     try:
-        data = json.loads(stripped)
-        if isinstance(data, dict):
-            quality = str(data.get("quality", "")).strip().lower()
-            subject = str(data.get("subject_present", "")).strip().lower()
-            answer = str(data.get("answer", "")).strip().lower()
-            if quality in ("good", "poor"):
-                out["quality"] = quality
-            if subject in (ANSWER_YES, ANSWER_NO, ANSWER_UNKNOWN):
-                out["subject_present"] = subject
-            if answer in (ANSWER_YES, ANSWER_NO, ANSWER_UNKNOWN):
-                out["answer"] = answer
-            out["quality_reasoning"] = str(data.get("quality_reasoning", "")).strip()
-            out["subject_reasoning"] = str(data.get("subject_reasoning", "")).strip()
-            out["reasoning"] = str(data.get("reasoning", "")).strip() or raw
-            return out
+        data = json.loads(_FENCE.sub("", (text or "").strip()).strip())
+        return data if isinstance(data, dict) else None
     except (ValueError, TypeError):
-        pass
+        return None
 
-    # Malformed JSON, or the keys embedded in prose.
+
+def parse_quality(text: str) -> tuple[str, str]:
+    """-> ("good" | "poor", reasoning). Defaults to "poor": calling a
+    photograph usable on no evidence is the failure that matters here."""
+    raw = (text or "").strip()
+    if not raw:
+        return "poor", ""
+    data = _loads(raw)
+    if data:
+        value = str(data.get("quality", "")).strip().lower()
+        if value in ("good", "poor"):
+            return value, _reasoning_from(raw, data)
     m = _QUALITY_RE.search(raw)
     if m:
-        out["quality"] = m.group(1).lower()
-    m = _SUBJECT_RE.search(raw)
+        return m.group(1).lower(), _reasoning_from(raw, data)
+    # Last resort: an unhedged "good" in the opening sentence.
+    first = re.split(r"(?<=[.!?])\s", raw, maxsplit=1)[0].lower()
+    if re.search(r"\bgood\b", first) and not re.search(r"\bpoor\b", first):
+        return "good", raw
+    return "poor", raw
+
+
+def parse_presence(text: str) -> tuple[str, str]:
+    """-> ("yes" | "no" | "unknown", reasoning). Defaults to "unknown"."""
+    raw = (text or "").strip()
+    if not raw:
+        return ANSWER_UNKNOWN, ""
+    data = _loads(raw)
+    if data:
+        value = str(data.get("present", data.get("subject_present", ""))).strip().lower()
+        if value in (ANSWER_YES, ANSWER_NO, ANSWER_UNKNOWN):
+            return value, _reasoning_from(raw, data)
+    m = _PRESENT_RE.search(raw)
     if m:
-        out["subject_present"] = m.group(1).lower()
+        return m.group(1).lower(), _reasoning_from(raw, data)
     answer, reasoning = parse_vlm_answer(raw)
-    out["answer"] = answer
-    out["reasoning"] = reasoning
-    return out
+    return answer, reasoning
 
 
-def mock_combined(question, model: str, error: Optional[str] = None) -> dict:
-    """A canned mode-3 result, labelled as such. Quality "poor" and presence
-    "unknown" on purpose: a mock must never assert that a photo is fine or a
-    subject visible when nothing looked at it."""
+def mock_vlm_only(question, model: str, error: Optional[str] = None) -> dict:
+    """A canned mode-3 result. Quality "poor" and presence "unknown" on purpose:
+    a mock must never assert that a photograph is fine or a subject visible when
+    nothing looked at it."""
+    note = "MOCK - no model examined this image."
     return {
-        "quality": "poor",
-        "quality_reasoning": "MOCK - no model examined this image.",
-        "subject_present": ANSWER_UNKNOWN,
-        "subject_reasoning": "MOCK - no model examined this image.",
+        "quality": "poor", "quality_reasoning": note,
+        "subject_present": ANSWER_UNKNOWN, "subject_reasoning": note,
         "answer": ANSWER_UNKNOWN,
         "reasoning": MOCK_REASONING.get(question.id, "MOCK - no model was called."),
         "raw_text": "", "model": model, "elapsed_s": 0.0,
         "error": error, "is_mock": True,
+        "legs": {LEG_QUALITY: {"raw": "", "elapsed_s": 0.0},
+                 LEG_PRESENCE: {"raw": "", "elapsed_s": 0.0},
+                 LEG_ANSWER: {"raw": "", "elapsed_s": 0.0}},
     }
+# ─────────────────────── Mode 3: one call, three judgements ──────────────────
+
+_QUALITY_RE = re.compile(r'"quality"\s*:\s*"(good|poor)"', re.IGNORECASE)
+_SUBJECT_RE = re.compile(r'"subject_present"\s*:\s*"(yes|no|unknown)"', re.IGNORECASE)

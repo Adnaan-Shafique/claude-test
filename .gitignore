@@ -19,3 +19,9 @@ models/*.onnx
 # "models/" is what silently swallowed src/YOLOX/yolox/models in the field-ops
 # repo, and app/vendor/yolox/models must stay tracked.
 /models/*.pth
+
+# Mode 3's tuned system prompts. Per-machine demo tuning, written by the UI -
+# the built-in prompts live in app/pipeline/questions.py, and the repo default
+# is the ABSENCE of this file (see MODES.md). Committing one machine's wording
+# would silently change what every other machine sends to the model.
+/config/prompts.yaml

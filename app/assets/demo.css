@@ -157,6 +157,12 @@ details.disclose[open]>summary::before{content:'– ';}
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.55;
   white-space:pre-wrap;max-height:330px;overflow:auto;color:var(--ink-2);}
 
+/* Mode 3 prompt editors: a monospace field, so an operator editing a system
+   prompt sees the same shape the model will. */
+textarea.prompt-edit{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:11.5px;line-height:1.55;resize:vertical;min-height:150px;
+  color:var(--ink-2);background:var(--bg);}
+
 /* ── Upload dropzone ──────────────────────────────────────────────────────── */
 /* Added after the dash-ui-v1 freeze. Additive only: no existing selector is
    modified, so app/demo_dash.py renders unchanged. */

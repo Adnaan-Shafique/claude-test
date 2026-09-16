@@ -8,7 +8,7 @@ Versions are what is actually installed on the demo host (FALCONPRD), not what
 | Software | Version | Licence | Used for |
 |---|---|---|---|
 | **Python** | 3.12.0 | PSF-2.0 | Runtime for everything below |
-| **Dash** | 4.4.1 | MIT | The demo UI (`demo_dash.py`, `demo_dash_yolox.py`) |
+| **Dash** | 4.4.1 | MIT | The demo UI (`demo_dash.py`, `demo_dash_yolox.py`, `demo_dash_modes.py`) |
 | **Plotly** | 6.9.0 | MIT | Dash dependency (components, rendering) |
 | **Flask** | 3.1.3 | BSD-3-Clause | Dash's web server |
 | **NumPy** | 2.5.3 | BSD-3-Clause | Array maths across all three stages |
@@ -16,6 +16,7 @@ Versions are what is actually installed on the demo host (FALCONPRD), not what
 | **Pillow** | 11.3.0 | MIT-CMU (HPND) | EXIF-correct image loading |
 | **pandas** | 2.3.3 | BSD-3-Clause | CSV export, results tables |
 | **Requests** | 2.34.2 | Apache-2.0 | HTTP client to the VLM server |
+| **PyYAML** | 6.0.1 | MIT | Stores mode 3's tuned system prompts (`config/prompts.yaml`) |
 | **Gradio** | 5.50.0 | Apache-2.0 | The earlier UI, kept as a fallback |
 
 ## Stage 1 — quality gate

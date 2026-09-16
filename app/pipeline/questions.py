@@ -244,58 +244,29 @@ def sampling_for(question: Question, cfg) -> dict:
     return base
 
 
-# ─────────────────────── Mode 3: one call, three judgements ──────────────────
+# ─────────────────── Mode 3: three legs, three system prompts ────────────────
 # Mode 3 replaces the classical quality gate and the trained detector with the
-# model itself. One call returns all three judgements, so they are mutually
-# consistent - the same pass that decided the photo is usable also decided
-# whether the subject is visible and answered the inspection question.
+# model. Each of the three judgements is its own call with its own system
+# prompt, so each can be tuned - and blamed - independently. The alternative,
+# one call returning all three, keeps them mutually consistent but makes a
+# wording change to one criterion move the other two answers with it.
 #
-# The question's OWN system prompt is reused verbatim rather than rewritten, so
-# there is still exactly one place where each question's framing lives. Only the
-# two extra judgements are described here.
+# These are DEFAULTS. pipeline/prompts.py loads any saved overrides from
+# config/prompts.yaml and the UI edits them live.
 
-COMBINED_SYSTEM_PREFIX = (
-    "You are reviewing a single photograph from a telecom site inspection and "
-    "must make THREE separate judgements about it: whether the photograph is of "
-    "usable quality, whether the subject of the inspection is actually visible "
-    "in it, and the inspection question itself. Judge each independently - a "
-    "blurry photograph can still clearly show its subject, and a sharp "
-    "photograph can be of the wrong thing. Answer only from what is visible, "
-    "and prefer \"unknown\" over guessing. Respond with JSON only.\n\n"
-    "The inspection question you are answering is framed as follows."
-)
+LEG_QUALITY = "quality"
+LEG_PRESENCE = "presence"
+LEG_ANSWER = "answer"
+LEGS = (LEG_QUALITY, LEG_PRESENCE, LEG_ANSWER)
 
-COMBINED_OUTPUT_CONTRACT = (
-    'Respond with JSON only, no markdown fence:\n'
-    '{"quality": "good" | "poor",\n'
-    ' "quality_reasoning": "<1 sentence: sharpness, exposure, framing>",\n'
-    ' "subject_present": "yes" | "no" | "unknown",\n'
-    ' "subject_reasoning": "<1 sentence: is the subject visible, and where>",\n'
-    ' "answer": "yes" | "no" | "unknown",\n'
-    ' "reasoning": "<2-3 sentences citing the specific visual evidence>"}'
-)
-
-COMBINED_TEMPLATE = """Make three judgements about this photograph.
-
-1. QUALITY - is this photograph usable for an inspection decision?
-good = sharp enough, exposed well enough and framed well enough to judge from.
-poor = blurred, too dark or bright, hazy, or the subject is too small or cut off.
-
-2. SUBJECT - is {subject} actually visible in the frame?
-yes = it is visible and identifiable.
-no  = it is not in this photograph.
-unknown = something may be there but it cannot be identified.
-
-3. THE INSPECTION QUESTION - {question_text}
-{semantics}
-
-Judge each independently: a poor-quality photograph can still answer the
-question, and a good-quality photograph of the wrong subject cannot.
-
-{output_contract}"""
+LEG_LABELS = {
+    LEG_QUALITY: "1 · Image quality",
+    LEG_PRESENCE: "2 · Subject present",
+    LEG_ANSWER: "3 · Inspection question",
+}
 
 # What each question is looking for, in words the model can match against the
-# image. Kept beside the questions themselves rather than in the mode code.
+# image. Used to build the presence leg's default prompt.
 SUBJECTS = {
     "hazard_warning": "a hazard, warning or danger sign, label or placard",
     "gps_antenna": "a GPS antenna",
@@ -307,19 +278,75 @@ QUESTION_TEXT = {
                     "sky?"),
 }
 
+QUALITY_SYSTEM_DEFAULT = (
+    "You are reviewing photographs taken during telecom site inspections and "
+    "judging whether each one is of usable quality for an inspection decision. "
+    "Consider sharpness, exposure, haze, and whether the subject is large "
+    "enough and fully enough in frame to be judged. Do not judge what the "
+    "photograph shows - only whether it can be judged from. A photograph can be "
+    "imperfect and still perfectly usable; reserve \"poor\" for photographs that "
+    "would genuinely prevent a decision. Respond with JSON only."
+)
 
-def combined_system_prompt(question: Question) -> str:
-    """The mode-3 system prompt: the shared three-judgement framing, then the
-    question's own system prompt verbatim."""
-    return f"{COMBINED_SYSTEM_PREFIX}\n\n{question.system_prompt}"
+PRESENCE_SYSTEM_DEFAULT = (
+    "You are reviewing photographs from telecom site inspections and "
+    "determining whether a specific piece of equipment or signage is visible in "
+    "the frame. Judge only presence and identifiability - not condition, not "
+    "compliance, not whether it is correctly installed. If something is "
+    "partially visible but cannot be confidently identified, answer "
+    "\"unknown\" rather than guessing. Respond with JSON only."
+)
+
+QUALITY_USER_TEMPLATE = """Is this photograph of usable quality for an inspection decision?
+good = sharp enough, exposed well enough and framed well enough to judge from.
+poor = blurred, too dark or too bright, hazy, or the subject is too small or cut off.
+
+Respond with JSON only, no markdown fence:
+{"quality": "good" | "poor", "reasoning": "<1-2 sentences on sharpness, exposure and framing>"}"""
+
+PRESENCE_USER_TEMPLATE = """Is {subject} visible in this photograph?
+yes     = it is visible and identifiable.
+no      = it is not in this photograph.
+unknown = something may be there but it cannot be confidently identified.
+
+Respond with JSON only, no markdown fence:
+{{"present": "yes" | "no" | "unknown", "reasoning": "<1-2 sentences: is it visible, and where>"}}"""
+
+ANSWER_USER_TEMPLATE = """{question_text}
+{semantics}
+
+Respond with JSON only, no markdown fence:
+{{"answer": "yes" | "no" | "unknown", "reasoning": "<2-3 sentences citing the specific visual evidence in the image>"}}"""
 
 
-def render_combined_prompt(question: Question) -> str:
-    """The mode-3 user prompt. No detection block: in mode 3 nothing has run
-    before this call, so there is no detector output to advise with."""
-    return COMBINED_TEMPLATE.format(
-        subject=SUBJECTS.get(question.id, "the subject of the inspection"),
-        question_text=QUESTION_TEXT.get(question.id, question.label),
-        semantics=question.answer_semantics,
-        output_contract=COMBINED_OUTPUT_CONTRACT,
-    )
+def default_leg_system(question: Question, leg: str) -> str:
+    """The built-in system prompt for one leg of mode 3.
+
+    The answer leg reuses the question's OWN system prompt verbatim, so there is
+    still exactly one place where each question's framing is authored - editing
+    it in the UI overrides that copy for mode 3 only, leaving modes 1 and 2 on
+    the original.
+    """
+    if leg == LEG_QUALITY:
+        return QUALITY_SYSTEM_DEFAULT
+    if leg == LEG_PRESENCE:
+        return PRESENCE_SYSTEM_DEFAULT
+    if leg == LEG_ANSWER:
+        return question.system_prompt
+    raise KeyError(f"Unknown leg {leg!r}; expected one of {LEGS}")
+
+
+def render_leg_user(question: Question, leg: str) -> str:
+    """The user prompt for one leg. Not editable: it carries the JSON contract
+    the parser depends on, and a demo is not the place to discover that someone
+    removed it."""
+    if leg == LEG_QUALITY:
+        return QUALITY_USER_TEMPLATE
+    if leg == LEG_PRESENCE:
+        return PRESENCE_USER_TEMPLATE.format(
+            subject=SUBJECTS.get(question.id, "the subject of the inspection"))
+    if leg == LEG_ANSWER:
+        return ANSWER_USER_TEMPLATE.format(
+            question_text=QUESTION_TEXT.get(question.id, question.label),
+            semantics=question.answer_semantics)
+    raise KeyError(f"Unknown leg {leg!r}; expected one of {LEGS}")

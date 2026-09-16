@@ -67,8 +67,12 @@ ProgressCb = Optional[Callable[[int, int, str], None]]
 
 
 def run_all_modes(image_paths, question_id: str, cfg,
-                  progress_cb: ProgressCb = None) -> dict:
-    """Every mode over every image. Returns {mode_id: [PipelineRecord]}."""
+                  progress_cb: ProgressCb = None, prompts=None) -> dict:
+    """Every mode over every image. Returns {mode_id: [PipelineRecord]}.
+
+    `prompts` is a PromptStore supplying mode 3's per-leg system prompts; None
+    means the built-in defaults.
+    """
     from .stage1_quality import (annotate_for_gallery, build_quality_config,
                                  preload_segmenter, score_image)
     from .stage2_detect import get_detector, render as render_detection
@@ -153,9 +157,16 @@ def run_all_modes(image_paths, question_id: str, cfg,
 
         # ── Mode 3 ───────────────────────────────────────────────────────────
         report(index, f"model-only pass {index}/{total}")
-        combined = client.ask_combined(image_bgr, question)
+        combined = client.ask_vlm_only(image_bgr, question, prompts=prompts)
+        # Mode 3 annotates nothing - no foreground box, no detector boxes - so
+        # its card would otherwise show a placeholder where the other two modes
+        # show the photograph. Write a plain EXIF-corrected copy instead. NOT
+        # the green u2netp box: that component did not run in this mode, and
+        # drawing its output here would credit it for work it did not do.
+        plain = run_dir / MODE_VLM_ONLY / "images" / f"{stem}.jpg"
         results[MODE_VLM_ONLY].append(_vlm_only_record(
-            path, stem, question_id, combined, quality, started))
+            path, stem, question_id, combined, quality, started,
+            image_bgr=image_bgr, image_path=plain))
 
     report(total, "writing results")
     for mode in MODE_ORDER:
@@ -188,8 +199,21 @@ def _record(path, stem, question_id, quality, detection, vlm, stopped, started,
     return record
 
 
+def _write_plain(image_bgr, dest: Path) -> Optional[str]:
+    """The photograph as mode 3 saw it, unannotated."""
+    import cv2
+
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(dest), image_bgr):
+            return None
+    except Exception:
+        return None
+    return str(dest)
+
+
 def _vlm_only_record(path, stem, question_id, combined, classical_quality,
-                     started) -> PipelineRecord:
+                     started, image_bgr=None, image_path=None) -> PipelineRecord:
     """Mode 3's result, mapped onto the same three panels the other modes fill.
 
     The quality and detection panels are filled from the model's own judgement
@@ -197,6 +221,10 @@ def _vlm_only_record(path, stem, question_id, combined, classical_quality,
     presence string instead of boxes. The frame size is carried over from the
     classical pass because it is a property of the file, not a judgement.
     """
+    annotated = None
+    if image_bgr is not None and image_path is not None:
+        annotated = _write_plain(image_bgr, Path(image_path))
+
     quality = QualityStageResult(
         passed=(combined["quality"] == "good"),
         score=0.0, threshold=0.0, resolution_ok=True, ignore_resolution_used=False,
@@ -204,7 +232,8 @@ def _vlm_only_record(path, stem, question_id, combined, classical_quality,
                          else [combined.get("quality_reasoning") or "judged poor"]),
         retake_instructions=[], foreground_box=None, segmentation_used=False,
         whole_frame_score=0.0, width=classical_quality.width,
-        height=classical_quality.height, assessed_by="vlm")
+        height=classical_quality.height, assessed_by="vlm",
+        annotated_path=annotated)
 
     detection = DetectionStageResult(
         detections=[], annotated_path=None,
@@ -220,7 +249,8 @@ def _vlm_only_record(path, stem, question_id, combined, classical_quality,
 
     return _record(path, stem, question_id, quality, detection, vlm,
                    STOPPED_COMPLETE, started,
-                   extra={"quality_reasoning": combined.get("quality_reasoning", "")})
+                   extra={"quality_reasoning": combined.get("quality_reasoning", ""),
+                          "legs": combined.get("legs", {})})
 
 
 def _unreadable(path, stem, question_id, error) -> PipelineRecord:
@@ -264,3 +294,53 @@ def agreement(results: dict) -> dict:
             unanimous += 1
     return {"total": len(rows), "unanimous": unanimous,
             "split": len(rows) - unanimous}
+
+
+def run_vlm_only(image_paths, question_id: str, cfg, progress_cb: ProgressCb = None,
+                 prompts=None) -> list:
+    """Mode 3 alone, for iterating on prompts.
+
+    Re-running all three after a wording change would spend the quality and
+    detection passes again to produce identical results - and those are the
+    expensive stages. This runs only what the prompt actually affects, so modes
+    1 and 2 keep their existing results and the comparison stays meaningful.
+    """
+    from .stage1_quality import build_quality_config, score_image
+    from .stage3_vlm import VLMClient
+    from quality_check import load_image_bgr
+
+    paths = [Path(p) for p in image_paths]
+    total = len(paths)
+    question = get_question(question_id)
+    if cfg.run_id is None:
+        cfg.run_id = new_run_id()
+    run_dir = cfg.run_dir
+
+    quality_config = build_quality_config(cfg)
+    client = VLMClient(cfg)
+    client.ensure_registry()
+
+    records = []
+    for index, path in enumerate(paths, start=1):
+        if progress_cb:
+            progress_cb(index, total, f"mode 3 · {index}/{total}")
+        started = time.time()
+        try:
+            image_bgr = load_image_bgr(path)
+        except Exception as exc:
+            records.append(_unreadable(path, path.stem, question_id, str(exc)))
+            continue
+        # The frame size is a property of the file, so it still comes from a
+        # classical read - not from a judgement.
+        classical = score_image(
+            image_bgr, config=quality_config, model_name=cfg.segmentation_model,
+            margin_trim=cfg.margin_trim, min_area_frac=cfg.min_area_frac,
+            max_area_frac=cfg.max_area_frac, ignore_resolution=cfg.ignore_resolution)
+        combined = client.ask_vlm_only(image_bgr, question, prompts=prompts)
+        plain = run_dir / MODE_VLM_ONLY / "images" / f"{path.stem}.jpg"
+        records.append(_vlm_only_record(path, path.stem, question_id, combined,
+                                        classical, started, image_bgr=image_bgr,
+                                        image_path=plain))
+
+    write_results(records, run_dir / MODE_VLM_ONLY)
+    return records
