@@ -242,3 +242,84 @@ def sampling_for(question: Question, cfg) -> dict:
     }
     base.update(question.sampling or {})
     return base
+
+
+# ─────────────────────── Mode 3: one call, three judgements ──────────────────
+# Mode 3 replaces the classical quality gate and the trained detector with the
+# model itself. One call returns all three judgements, so they are mutually
+# consistent - the same pass that decided the photo is usable also decided
+# whether the subject is visible and answered the inspection question.
+#
+# The question's OWN system prompt is reused verbatim rather than rewritten, so
+# there is still exactly one place where each question's framing lives. Only the
+# two extra judgements are described here.
+
+COMBINED_SYSTEM_PREFIX = (
+    "You are reviewing a single photograph from a telecom site inspection and "
+    "must make THREE separate judgements about it: whether the photograph is of "
+    "usable quality, whether the subject of the inspection is actually visible "
+    "in it, and the inspection question itself. Judge each independently - a "
+    "blurry photograph can still clearly show its subject, and a sharp "
+    "photograph can be of the wrong thing. Answer only from what is visible, "
+    "and prefer \"unknown\" over guessing. Respond with JSON only.\n\n"
+    "The inspection question you are answering is framed as follows."
+)
+
+COMBINED_OUTPUT_CONTRACT = (
+    'Respond with JSON only, no markdown fence:\n'
+    '{"quality": "good" | "poor",\n'
+    ' "quality_reasoning": "<1 sentence: sharpness, exposure, framing>",\n'
+    ' "subject_present": "yes" | "no" | "unknown",\n'
+    ' "subject_reasoning": "<1 sentence: is the subject visible, and where>",\n'
+    ' "answer": "yes" | "no" | "unknown",\n'
+    ' "reasoning": "<2-3 sentences citing the specific visual evidence>"}'
+)
+
+COMBINED_TEMPLATE = """Make three judgements about this photograph.
+
+1. QUALITY - is this photograph usable for an inspection decision?
+good = sharp enough, exposed well enough and framed well enough to judge from.
+poor = blurred, too dark or bright, hazy, or the subject is too small or cut off.
+
+2. SUBJECT - is {subject} actually visible in the frame?
+yes = it is visible and identifiable.
+no  = it is not in this photograph.
+unknown = something may be there but it cannot be identified.
+
+3. THE INSPECTION QUESTION - {question_text}
+{semantics}
+
+Judge each independently: a poor-quality photograph can still answer the
+question, and a good-quality photograph of the wrong subject cannot.
+
+{output_contract}"""
+
+# What each question is looking for, in words the model can match against the
+# image. Kept beside the questions themselves rather than in the mode code.
+SUBJECTS = {
+    "hazard_warning": "a hazard, warning or danger sign, label or placard",
+    "gps_antenna": "a GPS antenna",
+}
+
+QUESTION_TEXT = {
+    "hazard_warning": "does this photograph contain a hazardous-warning sign or label?",
+    "gps_antenna": ("is the GPS antenna properly mounted with an open view of the "
+                    "sky?"),
+}
+
+
+def combined_system_prompt(question: Question) -> str:
+    """The mode-3 system prompt: the shared three-judgement framing, then the
+    question's own system prompt verbatim."""
+    return f"{COMBINED_SYSTEM_PREFIX}\n\n{question.system_prompt}"
+
+
+def render_combined_prompt(question: Question) -> str:
+    """The mode-3 user prompt. No detection block: in mode 3 nothing has run
+    before this call, so there is no detector output to advise with."""
+    return COMBINED_TEMPLATE.format(
+        subject=SUBJECTS.get(question.id, "the subject of the inspection"),
+        question_text=QUESTION_TEXT.get(question.id, question.label),
+        semantics=question.answer_semantics,
+        output_contract=COMBINED_OUTPUT_CONTRACT,
+    )

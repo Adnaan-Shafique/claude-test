@@ -35,7 +35,8 @@ import uuid
 from typing import Iterable, Optional
 
 from .config import VLM_MODE_MOCK, SEND_FULL, SEND_FULL_CROP
-from .questions import ANSWER_NO, ANSWER_UNKNOWN, ANSWER_YES, render_user_prompt, \
+from .questions import ANSWER_NO, ANSWER_UNKNOWN, ANSWER_YES, \
+    combined_system_prompt, render_combined_prompt, render_user_prompt, \
     sampling_for, select_relevant
 from .schemas import VLMAnswer
 
@@ -386,6 +387,43 @@ class VLMClient:
             error=None, is_mock=False,
         )
 
+    def ask_combined(self, image_bgr, question) -> dict:
+        """Mode 3: quality, subject presence and the inspection answer in one
+        call. Never raises - a failure becomes a clearly-labelled mock."""
+        model = self.cfg.vlm_model
+        if self.cfg.vlm_mode == VLM_MODE_MOCK:
+            return mock_combined(question, model)
+
+        error = self.ensure_registry()
+        if error:
+            return mock_combined(question, model, error=f"registry unavailable: {error}")
+
+        system = combined_system_prompt(question)
+        prompt = render_combined_prompt(question)
+        sampling = dict(sampling_for(question, self.cfg))
+        # Three judgements and three reasonings need more room than one answer.
+        sampling["max_new_tokens"] = max(int(sampling["max_new_tokens"]), 420)
+
+        try:
+            uris = [array_to_data_uri(image_bgr)]
+            payload = build_payload(model, prompt, system, uris, sampling, self.registry)
+        except Exception as exc:
+            return mock_combined(question, model, error=describe_error(exc))
+
+        t0 = time.time()
+        try:
+            response = _post(self.base, "/infer", payload,
+                             timeout=self.cfg.request_timeout_s)
+        except Exception as exc:
+            return mock_combined(question, model, error=describe_error(exc))
+
+        text = response.get("text", "") or ""
+        result = parse_combined(text)
+        result.update(raw_text=text, model=response.get("model", model),
+                      elapsed_s=float(response.get("elapsed_s") or (time.time() - t0)),
+                      error=None, is_mock=False)
+        return result
+
     def _images_for(self, image_bgr, question, relevant) -> list[str]:
         """Full image, optionally plus a padded crop of the best relevant box."""
         uris = [array_to_data_uri(image_bgr)]
@@ -401,3 +439,74 @@ class VLMClient:
             return uris
         uris.append(array_to_data_uri(crop))
         return uris
+
+
+# ─────────────────────── Mode 3: one call, three judgements ──────────────────
+
+_QUALITY_RE = re.compile(r'"quality"\s*:\s*"(good|poor)"', re.IGNORECASE)
+_SUBJECT_RE = re.compile(r'"subject_present"\s*:\s*"(yes|no|unknown)"', re.IGNORECASE)
+
+
+def parse_combined(text: str) -> dict:
+    """Pull all three judgements out of one response.
+
+    Same descending tolerance as parse_vlm_answer: clean JSON first, then the
+    keys wherever they appear, then an honest fallback. A missing field never
+    fabricates a verdict - quality defaults to "poor" and presence to
+    "unknown", because claiming a photo is good or a subject present on no
+    evidence is the failure that matters here.
+    """
+    raw = (text or "").strip()
+    out = {"quality": "poor", "quality_reasoning": "", "subject_present": ANSWER_UNKNOWN,
+           "subject_reasoning": "", "answer": ANSWER_UNKNOWN, "reasoning": raw}
+    if not raw:
+        out["reasoning"] = ""
+        return out
+
+    stripped = _FENCE.sub("", raw).strip()
+    try:
+        data = json.loads(stripped)
+        if isinstance(data, dict):
+            quality = str(data.get("quality", "")).strip().lower()
+            subject = str(data.get("subject_present", "")).strip().lower()
+            answer = str(data.get("answer", "")).strip().lower()
+            if quality in ("good", "poor"):
+                out["quality"] = quality
+            if subject in (ANSWER_YES, ANSWER_NO, ANSWER_UNKNOWN):
+                out["subject_present"] = subject
+            if answer in (ANSWER_YES, ANSWER_NO, ANSWER_UNKNOWN):
+                out["answer"] = answer
+            out["quality_reasoning"] = str(data.get("quality_reasoning", "")).strip()
+            out["subject_reasoning"] = str(data.get("subject_reasoning", "")).strip()
+            out["reasoning"] = str(data.get("reasoning", "")).strip() or raw
+            return out
+    except (ValueError, TypeError):
+        pass
+
+    # Malformed JSON, or the keys embedded in prose.
+    m = _QUALITY_RE.search(raw)
+    if m:
+        out["quality"] = m.group(1).lower()
+    m = _SUBJECT_RE.search(raw)
+    if m:
+        out["subject_present"] = m.group(1).lower()
+    answer, reasoning = parse_vlm_answer(raw)
+    out["answer"] = answer
+    out["reasoning"] = reasoning
+    return out
+
+
+def mock_combined(question, model: str, error: Optional[str] = None) -> dict:
+    """A canned mode-3 result, labelled as such. Quality "poor" and presence
+    "unknown" on purpose: a mock must never assert that a photo is fine or a
+    subject visible when nothing looked at it."""
+    return {
+        "quality": "poor",
+        "quality_reasoning": "MOCK - no model examined this image.",
+        "subject_present": ANSWER_UNKNOWN,
+        "subject_reasoning": "MOCK - no model examined this image.",
+        "answer": ANSWER_UNKNOWN,
+        "reasoning": MOCK_REASONING.get(question.id, "MOCK - no model was called."),
+        "raw_text": "", "model": model, "elapsed_s": 0.0,
+        "error": error, "is_mock": True,
+    }

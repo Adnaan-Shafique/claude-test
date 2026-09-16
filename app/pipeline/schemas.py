@@ -60,6 +60,11 @@ class QualityStageResult:
     mask_mean_alpha: Optional[float] = None
     annotated_path: Optional[str] = None       # green foreground box drawn, for the UI
     error: Optional[str] = None                # set when scoring itself raised
+    # "classical" = the MM-IQA cue fusion in quality_check.py.
+    # "vlm"       = mode 3, where the model judged the photo instead. There is
+    #               no 0-100 score in that case, so `score` stays 0.0 and the
+    #               headline must not pretend otherwise.
+    assessed_by: str = "classical"
 
     @property
     def verdict(self) -> str:
@@ -91,6 +96,10 @@ class QualityStageResult:
         """One line for the UI card, honest about which gate rejected the image."""
         if self.error:
             return f"{ERROR} - {self.error}"
+        if self.assessed_by == "vlm":
+            # No numeric score exists here. Showing "PASS 0.0 / 65" would be a
+            # lie dressed as precision.
+            return f"{self.verdict} - judged by the model, no numeric score"
         base = f"{self.verdict} {self.score:.1f} / {self.threshold:.0f}"
         if self.fail_kind == "resolution":
             return f"{base}  (score is fine; failed the {self.width}x{self.height} resolution floor)"
@@ -142,6 +151,11 @@ class DetectionStageResult:
     # therefore reported stub results as real ones. Provenance is an honesty
     # requirement (plan section 3.3), so it is set by the detector, not guessed.
     is_stub: bool = False
+    # Mode 3 only: the model reports whether the subject is visible but draws no
+    # boxes, so presence is carried as text rather than geometry. None means
+    # this result came from a real detector and the box list is the answer.
+    presence: Optional[str] = None          # "yes" | "no" | "unknown"
+    presence_reasoning: str = ""
 
     def top(self) -> Optional[Detection]:
         return max(self.detections, key=lambda d: d.confidence, default=None)

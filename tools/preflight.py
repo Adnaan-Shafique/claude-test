@@ -36,6 +36,7 @@ PORTS = {
     7861: "review_ui.py (manual review)",
     7870: "demo_dash.py (integrated demo UI, annotation detector)",
     7871: "demo_dash_yolox.py (integrated demo UI, YOLOX detector)",
+    7872: "demo_dash_modes.py (integrated demo UI, three modes)",
 }
 
 _failures: list[str] = []
