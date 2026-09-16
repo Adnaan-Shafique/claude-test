@@ -96,6 +96,13 @@ are the expensive stages and a prompt change cannot affect them, so re-running
 everything would spend them to produce identical output. The comparison tab
 still lines up row for row afterwards.
 
+## Reaching the model
+
+All three modes call the same GPU server, either directly or through
+`llm_proxy_v3` on FALCONPRD when the host cannot see the GPU box. Mode 3 is the
+most affected by the choice: it makes three calls per photograph where modes 1
+and 2 share one. See `PROXY.md`.
+
 ## Files
 
 | Path | Role |

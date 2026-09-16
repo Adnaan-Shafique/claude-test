@@ -15,7 +15,7 @@ Versions are what is actually installed on the demo host (FALCONPRD), not what
 | **OpenCV** (`opencv-python-headless`) | 5.0.0.93 | Apache-2.0 | Image I/O, quality cues, box drawing |
 | **Pillow** | 11.3.0 | MIT-CMU (HPND) | EXIF-correct image loading |
 | **pandas** | 2.3.3 | BSD-3-Clause | CSV export, results tables |
-| **Requests** | 2.34.2 | Apache-2.0 | HTTP client to the VLM server |
+| **Requests** | 2.34.2 | Apache-2.0 | HTTP client to the VLM server (direct or via the proxy) |
 | **PyYAML** | 6.0.1 | MIT | Stores mode 3's tuned system prompts (`config/prompts.yaml`) |
 | **Gradio** | 5.50.0 | Apache-2.0 | The earlier UI, kept as a fallback |
 

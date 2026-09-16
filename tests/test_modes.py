@@ -328,6 +328,10 @@ check("each leg is labelled", all(l in layout_text for l in M_LEG_LABELS.values(
 check("prompts can be saved and reset",
       "prompt-save" in layout_text and "prompt-reset" in layout_text)
 check("mode 3 can be re-run on its own", "rerun3" in layout_text)
+check("the model route can be chosen in the UI", "transport" in layout_text)
+check("both routes are offered",
+      "Direct to the GPU server" in layout_text and "proxy" in layout_text.lower())
+check("there is somewhere to put the proxy's API key", "api-key" in layout_text)
 
 # Mode 3's quality panel: the photograph, the verdict, and no invented number.
 qpanel = ui.quality_column(rec3).text()

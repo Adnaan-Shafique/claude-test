@@ -194,20 +194,60 @@ def check_u2netp(offline_check: bool) -> None:
             fail(f"u2netp failed to load offline: {exc}")
 
 
-def check_gpu(gpu_url: str) -> None:
-    section(f"GPU server {gpu_url}")
+def check_gpu(gpu_url: str, transport: str = "direct", api_key: str = "") -> None:
+    """Check the model route the demo will actually use.
+
+    Both transports end at the same GPU server, so every assertion below is the
+    same; only the paths and the auth header differ. Checking /health on a
+    direct URL when the demo will run through the proxy proves nothing about
+    the demo - hence the transport argument rather than a second function.
+    """
+    label = "LLM proxy" if transport == "proxy" else "GPU server"
+    section(f"{label} {gpu_url} (transport={transport})")
     try:
         import requests
     except ImportError:
-        fail("requests is missing - cannot check the GPU server")
+        fail(f"requests is missing - cannot check the {label}")
         return
 
+    base = gpu_url.rstrip("/")
+    headers = {"X-API-Key": api_key} if (transport == "proxy" and api_key) else None
+    if transport == "proxy":
+        health_path, models_path = "/v1/gpu-health", "/v1/gpu-models"
+        # Ask the proxy about itself first: if it is down, every check below
+        # fails in a way that reads as "the GPU is down", which sends whoever
+        # is debugging to the wrong machine entirely.
+        try:
+            r = requests.get(f"{base}/v1/health", timeout=(5, 30))
+            r.raise_for_status()
+            info = r.json()
+        except Exception as exc:
+            fail(f"/v1/health unreachable: {type(exc).__name__}: {exc}\n"
+                 f"        The PROXY is not answering. Nothing below can pass. "
+                 f"Check llm_proxy_v3 is running on that host and port.")
+            return
+        ok(f"proxy v{info.get('version')} up - upstream={info.get('gpu_api_url')} "
+           f"auth_enabled={info.get('auth_enabled')}")
+        if info.get("auth_enabled") and not api_key:
+            fail("the proxy has authentication ENABLED but no API key was given "
+                 "- every request will come back 401. Pass --api-key or export "
+                 "FIELDOPS_VLM_API_KEY.")
+        elif not info.get("auth_enabled") and api_key:
+            warn("an API key was given but the proxy has auth disabled - the key "
+                 "is ignored and every client is logged as 'anonymous'")
+    else:
+        health_path, models_path = "/health", "/models"
+
     try:
-        r = requests.get(f"{gpu_url.rstrip('/')}/health", timeout=(5, 30))
+        r = requests.get(f"{base}{health_path}", timeout=(5, 30), headers=headers)
         r.raise_for_status()
         h = r.json()
     except Exception as exc:
-        fail(f"/health unreachable: {type(exc).__name__}: {exc}\n"
+        extra = ("        The proxy is up but cannot reach the GPU server behind "
+                 "it - the break is between those two, not here.\n"
+                 if transport == "proxy" else "")
+        fail(f"{health_path} unreachable: {type(exc).__name__}: {exc}\n"
+             f"{extra}"
              f"        The pipeline will fall back to mock mode. Test this from the "
              f"DEMO ROOM's network, not a dev box.")
         return
@@ -218,20 +258,29 @@ def check_gpu(gpu_url: str) -> None:
     ok(f"loaded models: {', '.join(loaded) or '(none)'}")
     ok(f"vision models: {', '.join(vision) or '(none)'}")
     if "qwen3-vl" not in loaded:
+        # llm_proxy_v3 forwards /infer and the read-only endpoints only. There
+        # is no passthrough for the GPU server's model-load route, so from
+        # behind the proxy you cannot warm the model yourself - somebody with a
+        # direct route has to, and it is worth saying so rather than printing a
+        # curl that will 404.
+        how = ("This cannot be done through the proxy - it forwards no model-load "
+               "route. Run it from a host with a direct route to the GPU server:\n"
+               "        curl -XPOST http://10.66.98.137:5432/models/qwen3-vl/load"
+               if transport == "proxy" else
+               f"curl -XPOST {base}/models/qwen3-vl/load")
         warn("qwen3-vl is NOT resident - the first question will pay a cold load "
-             "(minutes for a 30B MoE). Load it before the demo and leave it resident: "
-             f"curl -XPOST {gpu_url.rstrip('/')}/models/qwen3-vl/load")
+             f"(minutes for a 30B MoE). Load it before the demo:\n        {how}")
     else:
         ok("qwen3-vl is resident - no cold-load stall on the first question")
     if h.get("failed_models"):
         warn(f"failed loads reported: {json.dumps(h['failed_models'])}")
 
     try:
-        r = requests.get(f"{gpu_url.rstrip('/')}/models", timeout=(5, 30))
+        r = requests.get(f"{base}{models_path}", timeout=(5, 30), headers=headers)
         r.raise_for_status()
         models = r.json()
     except Exception as exc:
-        fail(f"/models unreachable: {exc}")
+        fail(f"{models_path} unreachable: {exc}")
         return
 
     # stage3_vlm MUST populate its registry from /models before building any
@@ -239,10 +288,11 @@ def check_gpu(gpu_url: str) -> None:
     # modality to "text" when it is empty, which makes EVERY image request raise
     # "'<model>' is text-only". Confirm the fields it depends on are present.
     by_name = {m["name"]: m for m in models}
-    ok(f"/models returned {len(models)} entries: {', '.join(sorted(by_name))}")
+    ok(f"{models_path} returned {len(models)} entries: {', '.join(sorted(by_name))}")
     demo_model = by_name.get("qwen3-vl")
     if not demo_model:
-        fail("qwen3-vl is not in /models - the demo model is missing from the registry")
+        fail(f"qwen3-vl is not in {models_path} - the demo model is missing "
+             f"from the registry")
         return
     if demo_model.get("modality") != "vision":
         fail(f"qwen3-vl reports modality={demo_model.get('modality')!r}, expected 'vision' "
@@ -383,7 +433,17 @@ def check_annotations(labels_dir=None) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--gpu-url", default="http://10.66.98.137:5432")
+    ap.add_argument("--gpu-url", default=os.environ.get(
+        "FIELDOPS_GPU_URL", "http://10.66.98.137:5432"),
+        help="the GPU server, or the proxy when --transport proxy")
+    ap.add_argument("--transport", choices=("direct", "proxy"),
+                    default=os.environ.get("FIELDOPS_VLM_TRANSPORT", "direct"),
+                    help="'proxy' checks llm_proxy_v3's /v1/* paths and sends "
+                         "X-API-Key. Check the route the DEMO will use.")
+    ap.add_argument("--api-key", default=os.environ.get("FIELDOPS_VLM_API_KEY", ""),
+                    help="X-API-Key for the proxy. Defaults to "
+                         "FIELDOPS_VLM_API_KEY so it need not appear in shell "
+                         "history.")
     ap.add_argument("--offline-check", action="store_true",
                     help="interactively verify u2netp loads with the network down")
     ap.add_argument("--skip-gpu", action="store_true")
@@ -405,7 +465,7 @@ def main() -> int:
     check_pipeline_imports()
     check_annotations(args.labels)
     if not args.skip_gpu:
-        check_gpu(args.gpu_url)
+        check_gpu(args.gpu_url, args.transport, args.api_key)
     check_ports(args.port)
 
     section("Summary")

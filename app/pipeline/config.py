@@ -32,6 +32,38 @@ DEFAULT_PROJECT_ROOT = _THIS.parents[2]
 DEFAULT_VLM_MODEL = "qwen3-vl"
 DEFAULT_GPU_URL = "http://10.66.98.137:5432"
 
+# ── How stage 3 reaches the model ────────────────────────────────────────────
+#
+# Not every demo host can see the GPU box. The field-ops VM (10.19.75.122)
+# cannot reach 10.66.98.137 at all; it can only reach FALCONPRD, which runs
+# llm_proxy_v3 and forwards on its behalf. That is a different HTTP contract,
+# not just a different address:
+#
+#   direct   POST /infer            GET /health        GET /models
+#   proxy    POST /v1/infer         GET /v1/health     GET /v1/models
+#            + X-API-Key header     + GET /v1/gpu-health, GET /v1/gpu-models
+#
+# Pointing gpu_url at the proxy WITHOUT switching transport gets a 404 on
+# /infer, which reads on stage as "the model is down" rather than "wrong path".
+TRANSPORT_DIRECT = "direct"
+TRANSPORT_PROXY = "proxy"
+TRANSPORTS = (TRANSPORT_DIRECT, TRANSPORT_PROXY)
+
+DEFAULT_PROXY_URL = "http://10.19.71.246:8071"
+
+# The proxy's InferRequest is a pydantic model, and pydantic IGNORES unknown
+# fields rather than rejecting them. repetition_penalty is not one of its
+# fields, so it is dropped in silence. At the demo default of 1.0 - the
+# server's own floor, i.e. no penalty - that changes nothing, which is why the
+# payload is otherwise left identical for both transports. Raise it and it
+# stops taking effect: validate() warns when that combination appears.
+PROXY_DROPS_FIELDS = ("repetition_penalty", "request_id", "client_id")
+
+# llm_proxy_v3: max_new_tokens is Field(..., ge=1, le=MAX_ALLOWED_TOKENS) with
+# MAX_ALLOWED_TOKENS defaulting to 8192. Over that is a 422 at the edge, before
+# any GPU time is spent.
+PROXY_MAX_NEW_TOKENS = 8192
+
 VLM_MODE_LIVE = "live"
 VLM_MODE_MOCK = "mock"
 
@@ -93,6 +125,13 @@ class PipelineConfig:
 
     # ── Stage 3: VLM ─────────────────────────────────────────────────────────
     gpu_url: str = DEFAULT_GPU_URL
+    # "direct" talks to gpu_api_server_v6; "proxy" talks to llm_proxy_v3, which
+    # forwards to the same GPU server from a host that can actually see it.
+    vlm_transport: str = TRANSPORT_DIRECT
+    # Sent as X-API-Key when transport is "proxy". Empty is legitimate: the
+    # proxy disables auth entirely when its API_KEYS env var is unset. Kept out
+    # of the repo - set FIELDOPS_VLM_API_KEY or type it into the UI.
+    vlm_api_key: str = ""
     vlm_model: str = DEFAULT_VLM_MODEL
     vlm_mode: str = VLM_MODE_LIVE
     vlm_send_mode: str = SEND_FULL
@@ -245,6 +284,29 @@ class PipelineConfig:
                 f"annotation_dir does not exist: {self.annotation_dir} - "
                 f"every image will report 'no annotation file found'"
             )
+        if self.vlm_transport not in TRANSPORTS:
+            problems.append(f"vlm_transport must be one of {list(TRANSPORTS)}, "
+                            f"got {self.vlm_transport!r}")
+        elif self.vlm_transport == TRANSPORT_PROXY:
+            # Not an error - llm_proxy_v3 runs with auth disabled when its
+            # API_KEYS env var is unset, and then labels everyone "anonymous".
+            # But a 401 mid-demo is worth one line of warning beforehand.
+            if not self.vlm_api_key.strip():
+                problems.append(
+                    "vlm_transport is 'proxy' but no API key is set - this works "
+                    "only if the proxy is running with API_KEYS unset. Otherwise "
+                    "every request comes back 401. Set FIELDOPS_VLM_API_KEY.")
+            if self.repetition_penalty != 1.0:
+                problems.append(
+                    f"repetition_penalty={self.repetition_penalty} will be SILENTLY "
+                    f"DROPPED: it is not a field on the proxy's InferRequest and "
+                    f"pydantic ignores unknown fields. Only 1.0 (no penalty) "
+                    f"behaves identically on both transports.")
+            if self.max_new_tokens > PROXY_MAX_NEW_TOKENS:
+                problems.append(
+                    f"max_new_tokens={self.max_new_tokens} exceeds the proxy's "
+                    f"limit of {PROXY_MAX_NEW_TOKENS} and will be rejected with a "
+                    f"422 before reaching the GPU.")
         if self.vlm_mode not in (VLM_MODE_LIVE, VLM_MODE_MOCK):
             problems.append(f"vlm_mode must be '{VLM_MODE_LIVE}' or '{VLM_MODE_MOCK}', got {self.vlm_mode!r}")
         if self.vlm_send_mode not in (SEND_FULL, SEND_FULL_CROP):
@@ -259,9 +321,34 @@ class PipelineConfig:
         return problems
 
 
+# Environment overrides, applied before any explicit keyword. They exist so a
+# host that must use the proxy can be configured once, in the service file or
+# the shell profile, rather than by editing a default that every other host
+# then inherits. An explicit argument still wins over the environment.
+ENV_OVERRIDES = {
+    "FIELDOPS_VLM_TRANSPORT": ("vlm_transport", str),
+    "FIELDOPS_GPU_URL": ("gpu_url", str),
+    "FIELDOPS_VLM_API_KEY": ("vlm_api_key", str),
+    "FIELDOPS_VLM_MODEL": ("vlm_model", str),
+}
+
+
+def env_overrides() -> dict:
+    """Config values taken from the environment. Blank is treated as unset:
+    an exported-but-empty FIELDOPS_VLM_API_KEY should mean "no key", which is
+    already the default, not "override with empty"."""
+    found = {}
+    for var, (field_name, cast) in ENV_OVERRIDES.items():
+        raw = os.environ.get(var)
+        if raw is None or not str(raw).strip():
+            continue
+        found[field_name] = cast(str(raw).strip())
+    return found
+
+
 def default_config(**overrides) -> PipelineConfig:
     cfg = PipelineConfig()
-    for key, value in overrides.items():
+    for key, value in {**env_overrides(), **overrides}.items():
         # The three path fields are properties backed by private attrs; setattr
         # routes through their setters, so this works for them too.
         if not hasattr(cfg, key):

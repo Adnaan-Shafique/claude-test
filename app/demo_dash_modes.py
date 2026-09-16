@@ -41,7 +41,9 @@ sys.path.insert(0, str(APP_DIR))
 
 from dash import Dash, Input, Output, State, dash_table, dcc, html, no_update  # noqa: E402
 
-from pipeline.config import (SEND_FULL, SEND_FULL_CROP, VLM_MODE_LIVE,  # noqa: E402
+from pipeline.config import (SEND_FULL, SEND_FULL_CROP,  # noqa: E402
+                            TRANSPORT_DIRECT, TRANSPORT_PROXY,
+                            VLM_MODE_LIVE,
                              VLM_MODE_MOCK, default_config)
 from pipeline.modes import (MODE_ORDER, MODE_VLM_ONLY, MODES,  # noqa: E402
                            agreement, compare_rows, run_all_modes, run_vlm_only)
@@ -68,7 +70,8 @@ FONT_SHEET = FONTS
 
 
 def _cfg_from_controls(checkpoint, classes, conf, nms, size_h, size_w, fuse,
-                       gpu_url, vlm_model, vlm_mode, send_mode, threshold, flags):
+                       gpu_url, vlm_model, vlm_mode, send_mode, threshold, flags,
+                       transport=None, api_key=None):
     flags = flags or []
     names = tuple(n.strip() for n in (classes or "").split(",") if n.strip())
     cfg = default_config(
@@ -80,6 +83,8 @@ def _cfg_from_controls(checkpoint, classes, conf, nms, size_h, size_w, fuse,
         yolox_fuse="fuse" in flags,
         conf_thresh=float(conf if conf is not None else 0.30),
         gpu_url=(gpu_url or "").strip(),
+        vlm_transport=(transport or TRANSPORT_DIRECT),
+        vlm_api_key=(api_key or "").strip(),
         vlm_model=(vlm_model or "qwen3-vl").strip(),
         vlm_mode=vlm_mode, vlm_send_mode=send_mode,
         quality_threshold=float(threshold) if threshold is not None else 65.0,
@@ -232,8 +237,30 @@ def controls():
                          "value": "run_on_fail"},
                     ], value=["fuse"]), className="field"),
                 html.Div([
-                    html.Label("GPU server", htmlFor="gpu-url"),
+                    html.Label("Route to the model"),
+                    dcc.RadioItems(
+                        id="transport", className="opt",
+                        options=[
+                            {"label": "Direct to the GPU server",
+                             "value": TRANSPORT_DIRECT},
+                            {"label": "Via the LLM proxy on FALCONPRD",
+                             "value": TRANSPORT_PROXY},
+                        ], value=cfg.vlm_transport),
+                    html.Div(id="transport-help", className="field-help"),
+                ], className="field"),
+                html.Div([
+                    html.Label("Server URL", htmlFor="gpu-url"),
                     dcc.Input(id="gpu-url", type="text", value=cfg.gpu_url),
+                ], className="field"),
+                html.Div([
+                    html.Label("API key (proxy only)", htmlFor="api-key"),
+                    # type="password" so a shoulder-surfer at the demo does not
+                    # read the key off the screen. It is still sent in a header,
+                    # not a URL, so it stays out of logs and history.
+                    dcc.Input(id="api-key", type="password",
+                              value=os.environ.get("FIELDOPS_VLM_API_KEY", ""),
+                              placeholder="X-API-Key — leave blank if the proxy "
+                                          "runs with auth disabled"),
                 ], className="field"),
                 html.Div([
                     html.Label("Model", htmlFor="vlm-model"),
@@ -385,14 +412,25 @@ def on_upload(filenames):
             html.Span(f" — {shown}")]
 
 
+@app.callback(Output("transport-help", "children"), Input("transport", "value"))
+def on_transport(transport):
+    if transport == TRANSPORT_PROXY:
+        return ("POST /v1/infer with an X-API-Key header. Use this where the box "
+                "cannot see the GPU server directly.")
+    return "POST /infer, no auth. Use this where the GPU server is reachable."
+
+
 @app.callback(Output("status", "children"), Input("check", "n_clicks"),
               State("ckpt", "value"), State("classes", "value"), State("conf", "value"),
               State("nms", "value"), State("size-h", "value"), State("size-w", "value"),
               State("flags", "value"), State("gpu-url", "value"),
+              State("transport", "value"), State("api-key", "value"),
               prevent_initial_call=True)
-def on_check(_clicks, ckpt, classes, conf, nms, size_h, size_w, flags, gpu_url):
+def on_check(_clicks, ckpt, classes, conf, nms, size_h, size_w, flags, gpu_url,
+             transport, api_key):
     cfg = _cfg_from_controls(ckpt, classes, conf, nms, size_h, size_w, flags,
-                             gpu_url, "qwen3-vl", VLM_MODE_LIVE, SEND_FULL, 65, flags)
+                             gpu_url, "qwen3-vl", VLM_MODE_LIVE, SEND_FULL, 65, flags,
+                             transport=transport, api_key=api_key)
     parts = []
 
     model_path = cfg.segmentation_model_path()
@@ -419,13 +457,25 @@ def on_check(_clicks, ckpt, classes, conf, nms, size_h, size_w, flags, gpu_url):
     client = VLMClient(cfg)
     health, error = client.health()
     if error:
+        # The error already distinguishes "proxy down" from "proxy up, GPU
+        # unreachable" - show it rather than flattening both into one line.
         parts += [html.Span(className="dot dot-bad"),
-                  html.Span("GPU server unreachable — answers will be MOCK")]
+                  html.Span(f"No model via {client.via} — answers will be MOCK. "
+                            f"{error}")]
     else:
         client.refresh_registry()
         loaded = ", ".join(health.get("loaded_models") or []) or "none"
+        note = ""
+        if client.registry_is_allowlist:
+            note = (" · registry came from the proxy's allowlist, not the GPU "
+                    "server's own — names and image caps only")
         parts += [html.Span(className="dot dot-ok"),
-                  html.Span(f"GPU server ok · loaded: {loaded}")]
+                  html.Span(f"Model reachable via {client.via} · loaded: "
+                            f"{loaded}{note}")]
+        if client.registry_error:
+            parts += [html.Span("|", className="status-sep"),
+                      html.Span(className="dot dot-warn"),
+                      html.Span(client.registry_error)]
     return parts
 
 
@@ -439,10 +489,11 @@ def on_check(_clicks, ckpt, classes, conf, nms, size_h, size_w, flags, gpu_url):
               State("threshold", "value"), State("flags", "value"),
               State("gpu-url", "value"), State("vlm-model", "value"),
               State("vlm-mode", "value"), State("send-mode", "value"),
+              State("transport", "value"), State("api-key", "value"),
               prevent_initial_call="initial_duplicate")
 def on_run(n_clicks, tab, mode, question_id, folder, upload_contents, upload_names,
            ckpt, classes, conf, nms, size_h, size_w, threshold, flags, gpu_url,
-           vlm_model, vlm_mode, send_mode):
+           vlm_model, vlm_mode, send_mode, transport, api_key):
     import dash
     triggered = (dash.callback_context.triggered[0]["prop_id"].split(".")[0]
                  if dash.callback_context.triggered else "")
@@ -454,7 +505,8 @@ def on_run(n_clicks, tab, mode, question_id, folder, upload_contents, upload_nam
 
 
     cfg = _cfg_from_controls(ckpt, classes, conf, nms, size_h, size_w, flags,
-                             gpu_url, vlm_model, vlm_mode, send_mode, threshold, flags)
+                             gpu_url, vlm_model, vlm_mode, send_mode, threshold, flags,
+                             transport=transport, api_key=api_key)
     problems = cfg.validate()
     blocking = [p for p in problems if "yolox_checkpoint" in p]
     if blocking:

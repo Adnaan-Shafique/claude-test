@@ -38,6 +38,11 @@ def main() -> int:
     ap.add_argument("--send", default="full", choices=["full", "full+crop"])
     ap.add_argument("--model", default=None)
     ap.add_argument("--gpu-url", default=None)
+    ap.add_argument("--transport", choices=("direct", "proxy"), default=None,
+                    help="'proxy' routes through llm_proxy_v3 (/v1/infer + "
+                         "X-API-Key). Defaults to FIELDOPS_VLM_TRANSPORT.")
+    ap.add_argument("--api-key", default=None,
+                    help="X-API-Key for the proxy; defaults to FIELDOPS_VLM_API_KEY")
     ap.add_argument("--mock", action="store_true", help="skip the GPU entirely")
     ap.add_argument("--skip-quality", action="store_true",
                     help="do not run stage 1 (faster; skips the u2netp load)")
@@ -52,6 +57,10 @@ def main() -> int:
     cfg = default_config(vlm_send_mode=args.send)
     if args.gpu_url:
         cfg.gpu_url = args.gpu_url
+    if args.transport:
+        cfg.vlm_transport = args.transport
+    if args.api_key:
+        cfg.vlm_api_key = args.api_key
     if args.model:
         cfg.vlm_model = args.model
     if args.mock:
@@ -60,7 +69,7 @@ def main() -> int:
     question = get_question(args.question)
     client = VLMClient(cfg)
 
-    print(f"GPU        : {cfg.gpu_url}")
+    print(f"route      : {client.via}")
     print(f"model      : {cfg.vlm_model}")
     print(f"question   : {question.id}  ({question.label})")
     print(f"semantics  : {question.answer_semantics}")

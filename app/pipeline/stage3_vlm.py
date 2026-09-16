@@ -24,6 +24,14 @@ and both of the server's prompt builders guard on `if system:`. A blank system
 prompt produces an unframed answer that looks like a model-quality problem.
 ask() asserts it is non-empty before sending, and debug_prompt() lets you verify
 it actually lands in the templated prompt.
+
+TWO TRANSPORTS, ONE GPU. A host that cannot see the GPU box reaches it through
+llm_proxy_v3 instead, which serves /v1/infer rather than /infer and wants an
+X-API-Key header. Every path difference lives in ENDPOINTS below; nothing else
+in this module knows which route is in use. Setting gpu_url to the proxy while
+leaving transport on "direct" is the failure to expect, and it presents as a
+404 - describe_error() says so in as many words rather than leaving it to look
+like a dead server.
 """
 from __future__ import annotations
 
@@ -34,7 +42,8 @@ import time
 import uuid
 from typing import Iterable, Optional
 
-from .config import VLM_MODE_MOCK, SEND_FULL, SEND_FULL_CROP
+from .config import (PROXY_DROPS_FIELDS, SEND_FULL, SEND_FULL_CROP,
+                     TRANSPORT_DIRECT, TRANSPORT_PROXY, VLM_MODE_MOCK)
 from .questions import ANSWER_NO, ANSWER_UNKNOWN, ANSWER_YES, \
     LEG_ANSWER, LEG_PRESENCE, LEG_QUALITY, default_leg_system, render_leg_user, \
     render_user_prompt, sampling_for, select_relevant
@@ -52,36 +61,132 @@ CONNECT_TIMEOUT_S = 10
 
 # ─────────────────────────────── HTTP ────────────────────────────────────────
 
+class Endpoints:
+    """The paths one transport uses. Both reach the same GPU server; only the
+    routing differs, and every difference here is a 404 waiting to happen if it
+    is got wrong.
+
+    `registry` is the endpoint that reports each model's modality and image cap.
+    On the proxy that is /v1/gpu-models, which passes the GPU server's own
+    registry through verbatim - so the parsing below is shared. /v1/models is
+    the proxy's ALLOWLIST, names only, and is the fallback when the GPU server
+    itself is unreachable from the proxy.
+    """
+
+    def __init__(self, infer, health, registry, gpu_health=None,
+                 allowlist=None, debug_prompt=None):
+        self.infer = infer
+        self.health = health
+        self.registry = registry
+        self.gpu_health = gpu_health
+        self.allowlist = allowlist
+        self.debug_prompt = debug_prompt
+
+
+ENDPOINTS = {
+    TRANSPORT_DIRECT: Endpoints(
+        infer="/infer", health="/health", registry="/models",
+        debug_prompt="/debug/prompt"),
+    TRANSPORT_PROXY: Endpoints(
+        infer="/v1/infer", health="/v1/health", registry="/v1/gpu-models",
+        gpu_health="/v1/gpu-health", allowlist="/v1/models",
+        # llm_proxy_v3 exposes no equivalent. debug_prompt() says so rather
+        # than letting a 404 masquerade as a dead server.
+        debug_prompt=None),
+}
+
+
+def endpoints_for(transport: str) -> Endpoints:
+    try:
+        return ENDPOINTS[transport]
+    except KeyError:
+        raise ValueError(f"Unknown vlm_transport {transport!r}; expected one of "
+                         f"{list(ENDPOINTS)}")
+
+
+def auth_headers(cfg) -> dict:
+    """X-API-Key, and only on the proxy. The direct server has no auth, and
+    sending a stray header there is noise in someone else's logs."""
+    if getattr(cfg, "vlm_transport", TRANSPORT_DIRECT) != TRANSPORT_PROXY:
+        return {}
+    key = (getattr(cfg, "vlm_api_key", "") or "").strip()
+    return {"X-API-Key": key} if key else {}
+
+
 def _url(base: str, path: str) -> str:
     return f"{base.rstrip('/')}{path}"
 
 
-def _get(base: str, path: str, timeout: int = 30):
+def _raise_for_status(r, path: str) -> None:
+    """One error shape for both verbs.
+
+    requests' own HTTPError reads "401 Client Error: ... for url: ...", which
+    describe_error() cannot key on - so a 401 on the registry GET would arrive
+    without the one line explaining it. Raising the same "HTTP <code> from
+    <path>" string a POST does means every status gets the same help.
+    """
+    if r.status_code < 400:
+        return
+    try:
+        detail = r.json().get("detail", r.text)   # FastAPI puts it in "detail"
+    except Exception:
+        detail = r.text
+    raise RuntimeError(f"HTTP {r.status_code} from {path}: {detail}")
+
+
+def _get(base: str, path: str, timeout: int = 30, headers: Optional[dict] = None):
     import requests
-    r = requests.get(_url(base, path), timeout=(CONNECT_TIMEOUT_S, timeout))
-    r.raise_for_status()
+    r = requests.get(_url(base, path), timeout=(CONNECT_TIMEOUT_S, timeout),
+                     headers=headers or None)
+    _raise_for_status(r, path)
     return r.json()
 
 
-def _post(base: str, path: str, payload: Optional[dict] = None, timeout: int = 180):
+def _post(base: str, path: str, payload: Optional[dict] = None, timeout: int = 180,
+          headers: Optional[dict] = None):
     import requests
     r = requests.post(_url(base, path), json=payload if payload is not None else {},
-                      timeout=(CONNECT_TIMEOUT_S, timeout))
-    if r.status_code >= 400:
-        try:
-            detail = r.json().get("detail", r.text)   # FastAPI puts it in "detail"
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"HTTP {r.status_code} from {path}: {detail}")
+                      timeout=(CONNECT_TIMEOUT_S, timeout), headers=headers or None)
+    _raise_for_status(r, path)
     return r.json()
 
 
-def describe_error(exc: Exception) -> str:
+# The proxy's own failure modes, translated. Each of these is reported by the
+# PROXY about the GPU server behind it, so "could not reach the GPU server"
+# would point at the wrong box entirely.
+_PROXY_STATUS_HELP = {
+    401: "The proxy requires an API key and none was sent. Set the API key "
+         "field (or FIELDOPS_VLM_API_KEY).",
+    403: "The proxy rejected this API key. Check it against the API_KEYS the "
+         "proxy was started with.",
+    404: "No such path on the proxy. This is what you get when gpu_url points "
+         "at the proxy but transport is still 'direct' - the proxy serves "
+         "/v1/infer, not /infer.",
+    413: "The image was too large for the proxy's MAX_IMAGE_CHARS limit.",
+    422: "The proxy rejected the request body - usually an unknown model name "
+         "or max_new_tokens above its ceiling.",
+    502: "The PROXY is up but cannot reach the GPU server behind it. The "
+         "problem is between the proxy and the GPU, not here.",
+    503: "The GPU server is saturated - every concurrency slot is busy. This "
+         "is load, not breakage; retry.",
+    504: "The GPU server did not respond in time. A first request after an "
+         "idle period can be a cold model load.",
+}
+
+
+def describe_error(exc: Exception, transport: str = TRANSPORT_DIRECT) -> str:
     import requests
+    where = "the proxy" if transport == TRANSPORT_PROXY else "the GPU server"
     if isinstance(exc, requests.exceptions.ConnectionError):
-        return f"Could not reach the GPU server. {exc}"
+        return f"Could not reach {where}. {exc}"
     if isinstance(exc, requests.exceptions.ReadTimeout):
-        return f"Timed out waiting for the GPU server. {exc}"
+        return f"Timed out waiting for {where}. {exc}"
+    if transport == TRANSPORT_PROXY and isinstance(exc, RuntimeError):
+        m = re.match(r"HTTP (\d+) ", str(exc))
+        if m:
+            help_text = _PROXY_STATUS_HELP.get(int(m.group(1)))
+            if help_text:
+                return f"{exc}  -  {help_text}"
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -145,7 +250,8 @@ def crop_for_detection(image_bgr, box, min_frame_frac: float = 0.20):
 # ─────────────────────────────── Payload ─────────────────────────────────────
 
 def build_payload(model: str, prompt: str, system: str, image_uris: list[str],
-                  sampling: dict, registry: dict) -> dict:
+                  sampling: dict, registry: dict,
+                  transport: str = TRANSPORT_DIRECT) -> dict:
     if not model:
         raise ValueError("No VLM model selected.")
     if not (prompt or "").strip():
@@ -194,6 +300,15 @@ def build_payload(model: str, prompt: str, system: str, image_uris: list[str],
         "request_id": str(uuid.uuid4()),
         "client_id": CLIENT_ID,
     }
+    if transport == TRANSPORT_PROXY:
+        # The proxy's InferRequest has no such fields and pydantic ignores what
+        # it does not declare, so these would be dropped in silence. Dropping
+        # them HERE instead means the payload we record is the payload that was
+        # honoured - nothing downstream can read a repetition_penalty off a run
+        # and believe it applied. The proxy issues its own request_id and
+        # derives client_id from the API key, so neither is lost, only moved.
+        for name in PROXY_DROPS_FIELDS:
+            payload.pop(name, None)
     if image_uris:
         payload["images"] = image_uris
     return payload
@@ -283,27 +398,103 @@ class VLMClient:
     def __init__(self, cfg):
         self.cfg = cfg
         self.base = cfg.gpu_url
+        self.transport = getattr(cfg, "vlm_transport", TRANSPORT_DIRECT)
+        self.endpoints = endpoints_for(self.transport)
+        self.headers = auth_headers(cfg)
         self.registry: dict = {}
         self.registry_error: Optional[str] = None
+        # Set when the registry came from the proxy's allowlist rather than the
+        # GPU server's own. The demo still runs, but the caps below are the
+        # proxy's mirror of the truth, not the truth.
+        self.registry_is_allowlist = False
+
+    @property
+    def via(self) -> str:
+        """One phrase naming the route, for status lines and error text."""
+        return (f"proxy {self.base}" if self.transport == TRANSPORT_PROXY
+                else f"GPU server {self.base}")
+
+    def _describe(self, exc: Exception) -> str:
+        return describe_error(exc, self.transport)
 
     # ── Server state ─────────────────────────────────────────────────────────
     def refresh_registry(self) -> tuple[list[str], Optional[str]]:
-        """Populate the registry from /models. MUST run before any payload is
-        built - see the module docstring."""
+        """Populate the registry. MUST run before any payload is built - see the
+        module docstring.
+
+        Direct: /models, the GPU server's registry.
+        Proxy:  /v1/gpu-models, which is that same registry passed through, so
+                the parsing is identical. If the proxy cannot reach the GPU it
+                answers 502 there; /v1/models still lists the names and image
+                caps the proxy itself enforces, which is enough to build a
+                payload, so that is the fallback rather than a dead end.
+        """
         try:
-            models = _get(self.base, "/models")
+            models = _get(self.base, self.endpoints.registry, headers=self.headers)
         except Exception as exc:
-            self.registry, self.registry_error = {}, describe_error(exc)
-            return [], self.registry_error
+            fallback_error = self._describe(exc)
+            if not self.endpoints.allowlist:
+                self.registry, self.registry_error = {}, fallback_error
+                return [], self.registry_error
+            names, error = self._registry_from_allowlist(fallback_error)
+            return names, error
+
         self.registry = {m["name"]: m for m in models}
+        self.registry_is_allowlist = False
+        self.registry_error = None
+        return list(self.registry), None
+
+    def _registry_from_allowlist(self, upstream_error: str):
+        """Synthesise a registry from the proxy's own /v1/models.
+
+        It returns {"models": [names], "image_caps": {name: n}}. A model with a
+        cap is one the proxy will accept images for - that is exactly what
+        MODEL_IMAGE_CAPS means there - so the cap's presence IS the modality.
+        """
+        try:
+            body = _get(self.base, self.endpoints.allowlist, headers=self.headers)
+        except Exception as exc:
+            self.registry = {}
+            self.registry_error = (
+                f"{upstream_error}  Also could not read the proxy's own model "
+                f"list: {self._describe(exc)}")
+            return [], self.registry_error
+
+        caps = body.get("image_caps") or {}
+        self.registry = {
+            name: {"name": name,
+                   "modality": "vision" if name in caps else "text",
+                   "max_images": caps.get(name)}
+            for name in (body.get("models") or [])
+        }
+        self.registry_is_allowlist = True
         self.registry_error = None
         return list(self.registry), None
 
     def health(self) -> tuple[Optional[dict], Optional[str]]:
+        """The GPU server's health, however it has to be reached.
+
+        On the proxy this is /v1/gpu-health, which is the GPU's own /health
+        passed through - so callers reading loaded_models keep working. When
+        that fails, /v1/health tells us whether the PROXY is alive, which is the
+        difference between "restart the proxy" and "the GPU box is down".
+        """
+        path = self.endpoints.gpu_health or self.endpoints.health
         try:
-            return _get(self.base, "/health"), None
+            return _get(self.base, path, headers=self.headers), None
         except Exception as exc:
-            return None, describe_error(exc)
+            error = self._describe(exc)
+            if self.endpoints.gpu_health:
+                try:
+                    proxy = _get(self.base, self.endpoints.health,
+                                 headers=self.headers)
+                except Exception:
+                    return None, f"{error}  The proxy itself is not answering either."
+                return None, (
+                    f"{error}  The proxy IS up (upstream "
+                    f"{proxy.get('gpu_api_url', 'unknown')}), so the break is "
+                    f"between the proxy and the GPU server.")
+            return None, error
 
     def vision_models(self) -> list[str]:
         return [n for n, i in self.registry.items() if i.get("modality") == "vision"]
@@ -324,6 +515,12 @@ class VLMClient:
         trap 9's failure is silent, so verify it rather than assuming.
         /debug/prompt only counts images, so cheap placeholders suffice.
         """
+        if not self.endpoints.debug_prompt:
+            return None, (
+                "llm_proxy_v3 exposes no /debug/prompt equivalent, so the "
+                "templated prompt cannot be rendered through the proxy. To "
+                "verify a system prompt lands, run this check from a host with "
+                "a direct route to the GPU server.")
         payload = {
             "model": self.cfg.vlm_model,
             "prompt": render_user_prompt(question),
@@ -331,9 +528,10 @@ class VLMClient:
             "images": ["x" * 4 for _ in range(n_images)] or None,
         }
         try:
-            return _post(self.base, "/debug/prompt", payload, timeout=120), None
+            return _post(self.base, self.endpoints.debug_prompt, payload,
+                         timeout=120, headers=self.headers), None
         except Exception as exc:
-            return None, describe_error(exc)
+            return None, self._describe(exc)
 
     # ── The question ─────────────────────────────────────────────────────────
     def ask(self, image_bgr, question, detections: Optional[Iterable] = None) -> VLMAnswer:
@@ -359,24 +557,25 @@ class VLMClient:
 
         try:
             payload = build_payload(model, prompt, question.system_prompt, uris,
-                                    sampling, self.registry)
+                                    sampling, self.registry, self.transport)
         except ImageCapExceeded:
             # Downgrade to the full image rather than erroring out mid-demo.
             try:
                 uris = [array_to_data_uri(image_bgr)]
                 payload = build_payload(model, prompt, question.system_prompt, uris,
-                                        sampling, self.registry)
+                                        sampling, self.registry, self.transport)
             except Exception as exc:
-                return mock_answer(question, model, error=describe_error(exc))
+                return mock_answer(question, model, error=self._describe(exc))
         except Exception as exc:
             return mock_answer(question, model, error=str(exc))
 
         t0 = time.time()
         try:
-            response = _post(self.base, "/infer", payload,
-                             timeout=self.cfg.request_timeout_s)
+            response = _post(self.base, self.endpoints.infer, payload,
+                             timeout=self.cfg.request_timeout_s,
+                             headers=self.headers)
         except Exception as exc:
-            return mock_answer(question, model, error=describe_error(exc))
+            return mock_answer(question, model, error=self._describe(exc))
 
         elapsed = float(response.get("elapsed_s") or (time.time() - t0))
         text = response.get("text", "") or ""
@@ -403,17 +602,18 @@ class VLMClient:
         try:
             uris = [image_uri or array_to_data_uri(image_bgr)]
             payload = build_payload(model, prompt, system, uris, sampling,
-                                    self.registry)
+                                    self.registry, self.transport)
         except Exception as exc:
-            return {"text": "", "error": describe_error(exc), "elapsed_s": 0.0,
+            return {"text": "", "error": self._describe(exc), "elapsed_s": 0.0,
                     "model": model}
 
         t0 = time.time()
         try:
-            response = _post(self.base, "/infer", payload,
-                             timeout=self.cfg.request_timeout_s)
+            response = _post(self.base, self.endpoints.infer, payload,
+                             timeout=self.cfg.request_timeout_s,
+                             headers=self.headers)
         except Exception as exc:
-            return {"text": "", "error": describe_error(exc), "elapsed_s": 0.0,
+            return {"text": "", "error": self._describe(exc), "elapsed_s": 0.0,
                     "model": model}
         return {"text": response.get("text", "") or "", "error": None,
                 "elapsed_s": float(response.get("elapsed_s") or (time.time() - t0)),
@@ -568,7 +768,3 @@ def mock_vlm_only(question, model: str, error: Optional[str] = None) -> dict:
                  LEG_PRESENCE: {"raw": "", "elapsed_s": 0.0},
                  LEG_ANSWER: {"raw": "", "elapsed_s": 0.0}},
     }
-# ─────────────────────── Mode 3: one call, three judgements ──────────────────
-
-_QUALITY_RE = re.compile(r'"quality"\s*:\s*"(good|poor)"', re.IGNORECASE)
-_SUBJECT_RE = re.compile(r'"subject_present"\s*:\s*"(yes|no|unknown)"', re.IGNORECASE)
