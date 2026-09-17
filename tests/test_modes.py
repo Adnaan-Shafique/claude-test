@@ -378,6 +378,55 @@ check("and a missing file falls back to the placeholder, not a broken img",
 check("modes 1 and 2 keep the frozen quality panel",
       "whole frame" in ui.quality_column(record("a", "yes")).text())
 
+print("\nuploads accumulate instead of replacing")
+import base64 as _b64, tempfile as _tf  # noqa: E402
+_stage_root = Path(_tf.mkdtemp())
+
+
+def _blob(name):
+    return "data:image/jpeg;base64," + _b64.b64encode(f"bytes-of-{name}".encode()).decode()
+
+
+staged = {"dir": str(_stage_root), "files": []}
+staged, added, skipped = ui._stage_uploads([_blob("a.jpg")], ["a.jpg"], staged)
+check("the first drop stages one", len(staged["files"]) == 1 and added == 1)
+staged, added, skipped = ui._stage_uploads([_blob("b.jpg")], ["b.jpg"], staged)
+check("a second drop ADDS rather than replacing - the whole point",
+      [e["name"] for e in staged["files"]] == ["a.jpg", "b.jpg"],
+      str(staged["files"]))
+staged, added, skipped = ui._stage_uploads([_blob("a.jpg")], ["a.jpg"], staged)
+check("re-dropping a name does not duplicate the photo",
+      len(staged["files"]) == 2 and added == 0, str(staged["files"]))
+check("the bytes really reached disk",
+      all(Path(e["path"]).read_bytes() for e in staged["files"]))
+staged, added, skipped = ui._stage_uploads([_blob("notes.txt")], ["notes.txt"], staged)
+check("a non-image is refused server-side too, not only by the browser",
+      skipped == ["notes.txt"] and len(staged["files"]) == 2, str(skipped))
+staged2, _, _ = ui._stage_uploads([_blob("x.jpg")], ["../../etc/x.jpg"],
+                                  {"dir": str(_stage_root), "files": []})
+check("a traversal in the filename is flattened to a basename",
+      Path(staged2["files"][0]["path"]).parent == _stage_root,
+      staged2["files"][0]["path"])
+
+paths, source = ui._resolve_inputs("", staged, None)
+check("a run sees every staged photo", len(paths) == 2, str(paths))
+check("and says where they came from", "staged" in source, source)
+Path(staged["files"][0]["path"]).unlink()
+paths, source = ui._resolve_inputs("", staged, None)
+check("a photo deleted under us is reported, not silently dropped",
+      len(paths) == 1 and "missing" in source, source)
+paths, source = ui._resolve_inputs("", {"dir": None, "files": []}, None)
+check("cleared uploads leave nothing to run", paths == [] and "Drop images" in source)
+
+note = ui._upload_note({"files": [{"name": "a.jpg"}, {"name": "b.jpg"}]}, added=1)
+# The note is a list of nodes; flatten it the way the stub renders a tree.
+text = " ".join(n.text() if isinstance(n, Node) else str(n) for n in note)
+check("the note counts what is STAGED, not what one drop carried",
+      "2 photo(s) staged" in text, text[:120])
+
+check("there is a way to clear them", "clear-uploads" in layout_text)
+check("and somewhere to keep them across drops", "staged" in layout_text)
+
 card = ui.result_card(record("a", "yes"), q)
 check("a gate reason is shown when present", True)
 gated = record("a", "yes")

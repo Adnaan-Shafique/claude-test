@@ -74,6 +74,12 @@ FONT_SHEET = FONTS
 UPLOAD_ACCEPT = ",".join(["image/*"] + sorted(IMAGE_EXTENSIONS))
 
 
+def cfg_for_staging():
+    """Config used only to locate the uploads folder, before any control has
+    been read. Nothing about a run depends on it."""
+    return default_config()
+
+
 def _cfg_from_controls(checkpoint, classes, conf, nms, size_h, size_w, fuse,
                        gpu_url, vlm_model, vlm_mode, send_mode, threshold, flags,
                        transport=None, api_key=None):
@@ -209,6 +215,15 @@ def controls():
                                     className="dz-sub"),
                        ])),
             html.Div(id="upload-note", className="dz-list"),
+            # Uploads ACCUMULATE here rather than being read off the component.
+            # A drag that hands the browser fewer files than were selected is a
+            # desktop-side failure we cannot fix from Python - but dropping the
+            # rest in a second gesture should add to the set, not replace it.
+            # Holding staged paths (not base64) keeps this light whatever the
+            # photographs weigh.
+            dcc.Store(id="staged", data={"dir": None, "files": []}),
+            html.Button("Clear photos", id="clear-uploads", n_clicks=0,
+                        className="btn btn-ghost"),
         ], className="card"),
 
         html.Div([
@@ -413,14 +428,84 @@ def on_prompt_buttons(save_clicks, reset_clicks, question_id, *values):
             f"Press \u201cRe-run mode 3 only\u201d to see the effect.")
 
 
-@app.callback(Output("upload-note", "children"), Input("uploads", "filename"))
-def on_upload(filenames):
-    if not filenames:
+def _stage_uploads(contents, filenames, staged):
+    """Write newly-arrived uploads to disk and add them to the staged set.
+
+    Staging on arrival rather than at run time means a second drop adds to the
+    first instead of replacing it, and the browser never has to hold several
+    photographs' worth of base64 while the operator collects them.
+
+    Returns (staged, added, skipped_names).
+    """
+    directory = staged.get("dir")
+    if not directory:
+        directory = str(cfg_for_staging().runs_dir / "uploads" / new_run_id())
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+
+    by_name = {entry["name"]: entry for entry in staged.get("files", [])}
+    added, skipped = 0, []
+    for content, name in zip(contents or [], filenames or []):
+        safe = Path(name).name
+        if Path(safe).suffix.lower() not in IMAGE_EXTENSIONS:
+            # The dropzone should have refused this, but a filter that runs
+            # only in the browser is a filter that can be bypassed.
+            skipped.append(safe)
+            continue
+        try:
+            _, b64 = content.split(",", 1)
+            dest = root / safe
+            dest.write_bytes(base64.b64decode(b64))
+        except Exception:
+            skipped.append(safe)
+            continue
+        if safe not in by_name:
+            added += 1
+        # Re-dropping a name overwrites it rather than duplicating the photo.
+        by_name[safe] = {"name": safe, "path": str(dest)}
+
+    ordered = sorted(by_name.values(), key=lambda e: e["name"])
+    return {"dir": str(root), "files": ordered}, added, skipped
+
+
+def _upload_note(staged, added=0, skipped=()):
+    files = staged.get("files", [])
+    if not files and not skipped:
         return ""
-    shown = ", ".join(filenames[:4]) + (f" +{len(filenames) - 4} more"
-                                        if len(filenames) > 4 else "")
-    return [html.Span(f"{len(filenames)} file(s) ready", className="dz-count"),
-            html.Span(f" — {shown}")]
+    names = [entry["name"] for entry in files]
+    shown = ", ".join(names[:4]) + (f" +{len(names) - 4} more"
+                                    if len(names) > 4 else "")
+    parts = [html.Span(f"{len(names)} photo(s) staged", className="dz-count"),
+             html.Span(f" — {shown}" if names else "")]
+    if added and added < len(names):
+        parts.append(html.Div(f"Added {added} in that drop; drop more to keep "
+                              f"building the set.", className="field-help"))
+    if skipped:
+        parts.append(html.Div(f"Ignored {len(skipped)}: {', '.join(skipped[:4])} "
+                              f"— not an image this pipeline reads.",
+                              className="banner banner-warn"))
+    return parts
+
+
+@app.callback(Output("upload-note", "children"), Output("staged", "data"),
+              Output("uploads", "contents"),
+              Input("uploads", "contents"), State("uploads", "filename"),
+              State("staged", "data"), prevent_initial_call=True)
+def on_upload(contents, filenames, staged):
+    if not contents:
+        return no_update, no_update, no_update
+    staged, added, skipped = _stage_uploads(contents, filenames, staged or {})
+    # Clearing the component's own contents does two jobs: it releases the
+    # base64 the browser is holding, and it lets the SAME file be dropped again
+    # later - an unchanged prop would not fire this callback a second time.
+    return _upload_note(staged, added, skipped), staged, None
+
+
+@app.callback(Output("upload-note", "children", allow_duplicate=True),
+              Output("staged", "data", allow_duplicate=True),
+              Input("clear-uploads", "n_clicks"), prevent_initial_call=True)
+def on_clear_uploads(_clicks):
+    return "", {"dir": None, "files": []}
 
 
 @app.callback(Output("transport-help", "children"), Input("transport", "value"))
@@ -494,7 +579,7 @@ def on_check(_clicks, ckpt, classes, conf, nms, size_h, size_w, flags, gpu_url,
               Output("status", "children", allow_duplicate=True),
               Input("run", "n_clicks"), Input("tabs", "value"), Input("mode", "value"),
               State("question", "value"), State("folder", "value"),
-              State("uploads", "contents"), State("uploads", "filename"),
+              State("staged", "data"),
               State("ckpt", "value"), State("classes", "value"), State("conf", "value"),
               State("nms", "value"), State("size-h", "value"), State("size-w", "value"),
               State("threshold", "value"), State("flags", "value"),
@@ -502,7 +587,7 @@ def on_check(_clicks, ckpt, classes, conf, nms, size_h, size_w, flags, gpu_url,
               State("vlm-mode", "value"), State("send-mode", "value"),
               State("transport", "value"), State("api-key", "value"),
               prevent_initial_call="initial_duplicate")
-def on_run(n_clicks, tab, mode, question_id, folder, upload_contents, upload_names,
+def on_run(n_clicks, tab, mode, question_id, folder, staged,
            ckpt, classes, conf, nms, size_h, size_w, threshold, flags, gpu_url,
            vlm_model, vlm_mode, send_mode, transport, api_key):
     import dash
@@ -525,7 +610,7 @@ def on_run(n_clicks, tab, mode, question_id, folder, upload_contents, upload_nam
                          className="card"),
                 [html.Span(className="dot dot-bad"), html.Span(blocking[0])])
 
-    paths, source = _resolve_inputs(folder, upload_contents, upload_names, cfg)
+    paths, source = _resolve_inputs(folder, staged, cfg)
     if not paths:
         return (html.Div(source, className="empty"),
                 [html.Span(className="dot dot-warn"), html.Span(source)])
@@ -588,9 +673,14 @@ def on_rerun3(_clicks, tab, mode):
                        f"prompts — {tally}. Modes 1 and 2 are unchanged.")])
 
 
-def _resolve_inputs(folder, upload_contents, upload_names, cfg):
-    """Folder path wins when given; uploads otherwise. Returns (paths, source)
-    or ([], message) when there is nothing to run."""
+def _resolve_inputs(folder, staged, cfg):
+    """Folder path wins when given; staged uploads otherwise. Returns
+    (paths, source) or ([], message) when there is nothing to run.
+
+    Uploads are already on disk by this point - on_upload stages them as they
+    arrive - so this only has to check they are still there. A file that
+    vanished between staging and Run is reported rather than silently dropped.
+    """
     if folder and folder.strip():
         root = Path(folder.strip())
         if not root.exists():
@@ -600,28 +690,19 @@ def _resolve_inputs(folder, upload_contents, upload_names, cfg):
             return [], f"No images found under {root}."
         return paths, str(root)
 
-    if upload_contents:
-        # Uploads arrive base64 in the callback. Stage them to disk so every
-        # stage sees a real path, exactly as a folder run would - the quality
-        # leg re-reads the file and the run folder keeps a copy of what was
-        # actually processed.
-        if cfg.run_id is None:
-            cfg.run_id = new_run_id()
-        staged = cfg.runs_dir / "uploads" / cfg.run_id
-        staged.mkdir(parents=True, exist_ok=True)
-        paths, skipped = [], 0
-        for content, name in zip(upload_contents, upload_names or []):
-            try:
-                _, b64 = content.split(",", 1)
-                dest = staged / Path(name).name
-                dest.write_bytes(base64.b64decode(b64))
-                paths.append(dest)
-            except Exception:
-                skipped += 1
+    entries = (staged or {}).get("files") or []
+    if entries:
+        paths, missing = [], []
+        for entry in entries:
+            path = Path(entry["path"])
+            (paths if path.exists() else missing).append(path)
         if not paths:
-            return [], "None of the uploaded files could be decoded."
-        note = f"{len(paths)} uploaded file(s)"
-        return paths, note + (f" ({skipped} skipped)" if skipped else "")
+            return [], ("The staged photos are no longer on disk - the run "
+                        "folder may have been cleared. Drop them again.")
+        note = f"{len(paths)} staged photo(s)"
+        if missing:
+            note += f" ({len(missing)} missing from disk)"
+        return paths, note
 
     return [], "Drop images above, or point at a photo folder on this machine."
 
