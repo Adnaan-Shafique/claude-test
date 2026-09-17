@@ -86,7 +86,14 @@ check("and every box would be 4/3 too large",
       f"{r_land_square / r_land_trained:.3f}")
 
 print("\nbuild_model explains itself when yolox.models is absent")
-sys.modules.pop("yolox.models", None)
+# Popping from sys.modules only clears the CACHE - the next import re-reads
+# from disk and succeeds on any machine that actually has the package. This
+# test then passed only where the thing it tests for was genuinely missing,
+# which is the wrong way round. A None entry in sys.modules is the documented
+# way to make an import fail on demand, so the absence is forced here rather
+# than assumed.
+_saved_models = sys.modules.get("yolox.models", "absent")
+sys.modules["yolox.models"] = None
 try:
     yr.build_model(2)
     check("missing yolox.models raises", False, "no exception")
@@ -97,6 +104,11 @@ except ImportError as exc:
     check("the message gives the copy command", "cp -r" in msg)
 except Exception as exc:
     check("missing yolox.models raises ImportError", False, f"got {type(exc).__name__}")
+finally:
+    if _saved_models == "absent":
+        sys.modules.pop("yolox.models", None)
+    else:
+        sys.modules["yolox.models"] = _saved_models
 
 print("\ndetector selection")
 from pipeline.stage2_detect import AnnotationFileDetector, YoloxDetector, get_detector  # noqa: E402

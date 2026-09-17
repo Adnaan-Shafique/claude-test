@@ -29,6 +29,27 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name}" + (f"\n         {detail}" if detail else ""))
 
 
+import os  # noqa: E402
+
+# Isolate the environment BEFORE the first default_config() call. A demo host
+# that is configured for the proxy exports these, and default_config() reads
+# them by design - so on such a box "a proxy with no API key" silently becomes
+# a proxy WITH one and the assertion tests the opposite of what it says. The
+# environment is a fixture here, restored at the end so a runner that set it
+# still has it afterwards.
+FIELDOPS_VARS = ("FIELDOPS_VLM_TRANSPORT", "FIELDOPS_GPU_URL",
+                 "FIELDOPS_VLM_API_KEY", "FIELDOPS_VLM_MODEL")
+SAVED_ENV = {v: os.environ.pop(v, None) for v in FIELDOPS_VARS}
+
+
+def restore_env():
+    for var, value in SAVED_ENV.items():
+        if value is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = value
+
+
 from pipeline.config import (PROXY_DROPS_FIELDS, PROXY_MAX_NEW_TOKENS,  # noqa: E402
                              TRANSPORT_DIRECT, TRANSPORT_PROXY,
                              default_config, env_overrides)
@@ -259,10 +280,7 @@ check("the direct default needs no API key",
       not any("API key" in p for p in default_config().validate()))
 
 print("\nthe environment can select the transport without a code edit")
-import os  # noqa: E402
-for var in ("FIELDOPS_VLM_TRANSPORT", "FIELDOPS_GPU_URL", "FIELDOPS_VLM_API_KEY"):
-    os.environ.pop(var, None)
-check("nothing set means nothing overridden", env_overrides() == {})
+check("nothing set means nothing overridden", env_overrides() == {}, str(env_overrides()))
 os.environ["FIELDOPS_VLM_TRANSPORT"] = TRANSPORT_PROXY
 os.environ["FIELDOPS_GPU_URL"] = "http://10.19.71.246:8071"
 os.environ["FIELDOPS_VLM_API_KEY"] = "secret-falcon1"
@@ -275,8 +293,11 @@ check("an explicit argument still beats the environment",
 os.environ["FIELDOPS_VLM_API_KEY"] = "   "
 check("an exported-but-blank variable means unset, not empty-override",
       "vlm_api_key" not in env_overrides())
-for var in ("FIELDOPS_VLM_TRANSPORT", "FIELDOPS_GPU_URL", "FIELDOPS_VLM_API_KEY"):
-    os.environ.pop(var, None)
+
+restore_env()
+check("the runner's own environment is put back",
+      {v: os.environ.get(v) for v in FIELDOPS_VARS}
+      == {v: (val if val is not None else None) for v, val in SAVED_ENV.items()})
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
