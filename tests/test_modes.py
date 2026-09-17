@@ -242,7 +242,11 @@ class Node:
         # a test asserting "all three modes are offered" has to be able to see
         # them, so it is flattened here rather than skipped.
         bits = [str(v) for k, v in self.kw.items()
-                if k in ("className", "id", "title", "alt", "label", "value")]
+                if k in ("className", "id", "title", "alt", "label", "value",
+                         # `accept` decides which dropped files the browser
+                         # hands over at all, so a test about uploads has to
+                         # be able to see it.
+                         "accept")]
         for option in self.kw.get("options") or []:
             bits.append(str(option))
         c = self.children
@@ -306,6 +310,23 @@ check("a Compare tab exists", "compare" in layout_text)
 check("the run button says it runs all three",
       "Run all three modes" in layout_text)
 check("upload survives from the YOLOX app", "dropzone" in layout_text)
+
+# The dropzone must accept files the browser cannot type. accept="image/*"
+# alone filters on the reported MIME type, and a file dragged from a network
+# share or a mapped drive arrives with none - react-dropzone then discards it
+# in silence, so dropping five photographs delivered one with no error shown.
+from pipeline.orchestrator import IMAGE_EXTENSIONS  # noqa: E402
+check("the dropzone still accepts image MIME types", "image/*" in ui.UPLOAD_ACCEPT)
+for ext in sorted(IMAGE_EXTENSIONS):
+    check(f"...and {ext} by extension, whatever MIME the browser reports",
+          ext in ui.UPLOAD_ACCEPT, ui.UPLOAD_ACCEPT)
+check("accept and the folder scan agree on what a photograph is",
+      {t for t in ui.UPLOAD_ACCEPT.split(",") if t.startswith(".")}
+      == set(IMAGE_EXTENSIONS), ui.UPLOAD_ACCEPT)
+check("the layout uses that accept rather than a literal",
+      ui.UPLOAD_ACCEPT in layout_text, ui.UPLOAD_ACCEPT)
+check("a non-image extension is still not accepted",
+      ".txt" not in ui.UPLOAD_ACCEPT and ".csv" not in ui.UPLOAD_ACCEPT)
 
 # Mode 3's detection panel must not read as "found nothing".
 rec3 = M._vlm_only_record(Path("/p/a.jpg"), "a", "hazard_warning", combined,

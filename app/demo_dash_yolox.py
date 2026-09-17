@@ -32,8 +32,9 @@ from dash import Dash, Input, Output, State, dash_table, dcc, html, no_update  #
 
 from pipeline.config import (SEND_FULL, SEND_FULL_CROP, VLM_MODE_LIVE,  # noqa: E402
                              VLM_MODE_MOCK, default_config)
-from pipeline.orchestrator import (collect_images, new_run_id,  # noqa: E402
-                                   run_pipeline, sort_for_display, summarise)
+from pipeline.orchestrator import (IMAGE_EXTENSIONS, collect_images,  # noqa: E402
+                                   new_run_id, run_pipeline, sort_for_display,
+                                   summarise)
 from pipeline.questions import QUESTIONS, get_question  # noqa: E402
 
 # Shared renderers - see the module docstring on why these are imported.
@@ -41,6 +42,11 @@ from demo_dash import (FONTS, QUESTION_OPTIONS, FIRST, prompt_text,  # noqa: E40
                        results_view, summary_view, tile)
 
 FONT_SHEET = FONTS
+
+
+# image/* plus every extension the folder scan accepts, so the two agree and a
+# missing MIME type cannot lose a photograph. See the dropzone comment below.
+UPLOAD_ACCEPT = ",".join(["image/*"] + sorted(IMAGE_EXTENSIONS))
 
 
 def _cfg_from_controls(checkpoint, classes, conf, nms, size_h, size_w, fuse,
@@ -120,8 +126,14 @@ def controls():
             # that one needed a .txt sidecar beside each photo and a browser
             # upload cannot carry one. A trained detector reads the image, so
             # dragging a photo straight off a laptop works end to end.
+            # accept lists EXTENSIONS as well as image/*. On its own, image/*
+            # filters on the MIME type the browser reports - and a file dragged
+            # from a network share, a mapped drive or some file managers
+            # arrives with no type at all. react-dropzone then discards it
+            # silently, so dropping five photographs could deliver one with no
+            # error anywhere. Extension tokens match regardless of MIME.
             dcc.Upload(id="uploads", multiple=True, className="dropzone",
-                       accept="image/*", children=html.Div([
+                       accept=UPLOAD_ACCEPT, children=html.Div([
                            html.Div("Drop images here, or click to browse",
                                     className="dz-main"),
                            html.Div("JPG, PNG, TIFF · the detector reads the image "

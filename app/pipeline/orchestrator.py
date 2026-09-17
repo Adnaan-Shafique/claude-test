@@ -219,10 +219,16 @@ def write_results(records: list[PipelineRecord], run_dir: Path) -> tuple[Path, P
     return csv_path, json_path
 
 
+# One source of truth for what counts as a photograph. The upload dropzone's
+# accept attribute is built from this too, so a file the folder scan would take
+# is never one the browser silently refuses.
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"})
+
+
 def collect_images(folder, extensions=None) -> list[Path]:
     """Every image under a folder, recursively - the demo photos live in
     per-class subfolders."""
-    extensions = extensions or {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    extensions = extensions or IMAGE_EXTENSIONS
     folder = Path(folder)
     if folder.is_file():
         return [folder]
