@@ -1,0 +1,49 @@
+# Three-mode field-ops demo UI (app/demo_dash_modes.py), port 7872.
+#
+# Install per SERVICE.md. Every path below assumes the field-ops VM layout:
+#   /data/adnaan/field_ops/integrated_pipeline
+# Change ROOT, User and Group to match `pwd` and `id` on your host.
+
+[Unit]
+Description=Field Ops demo - three pipeline modes (Dash, port 7872)
+Documentation=file:///data/adnaan/field_ops/integrated_pipeline/MODES.md
+# network-online, not just network: the app contacts the LLM proxy while
+# building its status line, and "network" alone is satisfied before an address
+# is actually configured.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ADMIN
+Group=ADMIN
+WorkingDirectory=/data/adnaan/field_ops/integrated_pipeline
+
+# The API key lives here, not in this file: a unit file is world-readable by
+# design, and `systemctl cat` prints it to anyone who asks. Keep the env file
+# at chmod 600. The leading '-' means the service still starts if it is
+# absent - useful when the proxy runs with auth disabled.
+EnvironmentFile=-/etc/fieldops-demo.env
+
+# Unbuffered, or journalctl shows nothing until Python flushes - which during
+# a slow pipeline run can be minutes.
+Environment=PYTHONUNBUFFERED=1
+Environment=DASH_HOST=0.0.0.0
+Environment=DASH_PORT=7872
+
+ExecStart=/data/adnaan/field_ops/integrated_pipeline/venv_yolox/bin/python \
+          /data/adnaan/field_ops/integrated_pipeline/app/demo_dash_modes.py
+
+Restart=always
+RestartSec=5
+# A run holds the worker for seconds per photograph; give it room to finish
+# rather than killing it mid-batch on stop.
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fieldops-demo-modes
+
+[Install]
+WantedBy=multi-user.target

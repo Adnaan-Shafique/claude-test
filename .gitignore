@@ -25,3 +25,8 @@ models/*.onnx
 # is the ABSENCE of this file (see MODES.md). Committing one machine's wording
 # would silently change what every other machine sends to the model.
 /config/prompts.yaml
+
+# A filled-in service environment file holds the proxy API key. Only the
+# .example template is tracked; see SERVICE.md.
+fieldops-demo.env
+deploy/fieldops-demo.env
