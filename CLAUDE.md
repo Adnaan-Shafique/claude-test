@@ -164,3 +164,8 @@ bullet lists.
 Two companion logs are kept up to date by hand: `DECISIONS.md` (why things are
 the way they are) and `CHANGELOG.md` (what changed, when). Add to them when a
 change is worth explaining later.
+
+`README.md` is the front door for a human arriving cold — what the pipeline
+does, the three UIs and ports, a quick start, and a map of the other documents.
+This file is the one for a Claude session; keep the split, and do not duplicate
+architecture into the README.
